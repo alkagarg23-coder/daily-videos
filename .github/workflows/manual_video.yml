@@ -1,43 +1,92 @@
 name: Manual Video Generator
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11' 
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install system dependencies (FFmpeg for video)
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Install Ollama & Pull Qwen Model (NO API Needed!)
+      - name: Install FFmpeg
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Ollama
+        shell: bash
+        run: |
+          set -e
           curl -fsSL https://ollama.com/install.sh | sh
-          # Ollama server ko background mein start karo
-          ollama serve &
-          sleep 5
-          # Qwen ka 3 Billion parameter wala fast model download karo
+
+      - name: Start Ollama
+        shell: bash
+        run: |
+          set -e
+          ollama serve > /tmp/ollama.log 2>&1 &
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
+              echo "Ollama is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Ollama failed to start."
+          cat /tmp/ollama.log || true
+          exit 1
+
+      - name: Pull Qwen model
+        run: |
+          set -e
           ollama pull qwen2.5:3b
 
       - name: Install Python dependencies
         run: |
-          # 1. Tenacity ka naya version (Python 3.11 fix) aur pycryptodome (Mega fix) install karo
-          pip install "tenacity>=8.2.2" pycryptodome requests edge-tts moviepy==1.0.3 "Pillow<10.0.0"
-          
-          # 2. Ab mega.py ko bina kisi purane kachre ke (no-dependencies) install karo
+          set -e
+          python -m pip install --upgrade pip
+          pip install \
+            "tenacity>=8.2.2" \
+            pycryptodome \
+            requests \
+            edge-tts \
+            "moviepy==1.0.3" \
+            "Pillow<10.0.0" \
+            PyYAML
           pip install mega.py --no-deps
 
-      - name: Run Full Pipeline
+      - name: Validate pipeline before running
+        run: |
+          set -e
+          python -m py_compile pipeline.py
+          python - <<'PY'
+          import yaml
+          with open(".github/workflows/manual-video.yml", "r", encoding="utf-8") as f:
+              workflow = yaml.safe_load(f)
+          assert isinstance(workflow, dict), "Workflow YAML is not an object"
+          assert "jobs" in workflow, "Workflow has no jobs"
+          assert "generate-and-upload" in workflow["jobs"], "Expected job is missing"
+          print("YAML validation OK")
+          PY
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+      - name: Run video pipeline
         env:
           MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
           MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
-        run: python pipeline.py
+        run: |
+          set -e
+          python pipeline.py
