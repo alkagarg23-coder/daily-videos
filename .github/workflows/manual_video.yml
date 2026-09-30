@@ -1,7 +1,7 @@
 name: Manual Video Generator
 
 on:
-  workflow_dispatch: # Sirf manual button dabane par chalega
+  workflow_dispatch: 
 
 jobs:
   generate-and-upload:
@@ -14,16 +14,17 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11' # Fixed: 3.10 deprecation warning gone
+          python-version: '3.11' 
 
       - name: Install system dependencies (FFmpeg for video)
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install Python dependencies
-        # Fixed: Added Pillow<10.0.0 to prevent MoviePy crashes
-        # Fixed: Using new google-genai package
         run: |
-          pip install google-genai edge-tts mega.py requests moviepy==1.0.3 "Pillow<10.0.0"
+          # Pehle pycryptodome aur baaki zaroori packages install karenge taaki pycrypto ka error na aaye
+          pip install pycryptodome requests tenacity google-genai edge-tts moviepy==1.0.3 "Pillow<10.0.0"
+          # Ab mega.py ko bina uske purane dependencies ke install karenge
+          pip install mega.py --no-deps
 
       - name: Run Full Pipeline
         env:
