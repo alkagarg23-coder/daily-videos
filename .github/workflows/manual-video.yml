@@ -1,10 +1,13 @@
-name: Manual Video Generator
+name: Daily Auto Video Generator
 
 on:
-  workflow_dispatch:
+  schedule:
+    # Roj raat 12:00 UTC (Subah 5:30 AM IST) apne aap chalega
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Isse tum manually bhi jab chaho chala sakte ho
 
 permissions:
-  contents: read
+  contents: write # Counter update karke commit karne ke liye zaroori hai
 
 jobs:
   generate-and-upload:
@@ -70,3 +73,12 @@ jobs:
         run: |
           set -e
           python pipeline.py
+
+      # Auto-save counter back to GitHub repository
+      - name: Commit and push counter update
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add counter.txt
+          git commit -m "Auto-update video counter [skip ci]" || echo "No changes to commit"
+          git push
