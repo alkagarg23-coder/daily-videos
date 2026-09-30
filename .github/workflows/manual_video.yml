@@ -1,0 +1,32 @@
+name: Manual Video Generator
+
+on:
+  workflow_dispatch: # Sirf button dabane par chalega
+
+jobs:
+  generate-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies (FFmpeg for video)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        # moviepy==1.0.3 video banane ke kaam aayegi
+        run: |
+          pip install google-generativeai edge-tts mega.py requests moviepy==1.0.3
+
+      - name: Run Full Pipeline
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+        run: python pipeline.py
