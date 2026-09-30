@@ -19,16 +19,23 @@ jobs:
       - name: Install system dependencies (FFmpeg for video)
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: Install Python dependencies
+      - name: Install Ollama & Pull Qwen Model (NO API Needed!)
         run: |
-          # Pehle pycryptodome aur baaki zaroori packages install karenge taaki pycrypto ka error na aaye
-          pip install pycryptodome requests tenacity google-genai edge-tts moviepy==1.0.3 "Pillow<10.0.0"
-          # Ab mega.py ko bina uske purane dependencies ke install karenge
-          pip install mega.py --no-deps
+          curl -fsSL https://ollama.com/install.sh | sh
+          # Ollama server ko background mein start karo
+          ollama serve &
+          sleep 5
+          # Qwen ka 3 Billion parameter wala fast model download karo
+          ollama pull qwen2.5:3b
+
+      - name: Install Python dependencies
+        # Ab humein google-genai ki zaroorat nahi hai
+        run: |
+          pip install requests edge-tts mega.py moviepy==1.0.3 "Pillow<10.0.0"
 
       - name: Run Full Pipeline
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Sirf Mega ka email password chahiye, Gemini ki API key ab hata di!
           MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
           MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
         run: python pipeline.py
