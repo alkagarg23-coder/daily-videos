@@ -50,9 +50,9 @@ Structure:
 Generate exactly 15 script_sections.
 """
 
-# YAHAN CHANGE KIYA HAI: Model ab gemini-1.5-flash hai
+# YAHAN LATEST VERSION LAGA DIYA HAI 🔥
 response = client.models.generate_content(
-    model='gemini-1.5-flash',
+    model='gemini-2.5-flash', 
     contents=prompt
 )
 
