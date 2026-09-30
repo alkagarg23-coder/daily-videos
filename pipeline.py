@@ -4,28 +4,24 @@ import asyncio
 import urllib.parse
 import requests
 import edge_tts
-from google import genai
 from mega import Mega
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
 # ==========================================
-# 1. SETUP & API KEYS
+# 1. SETUP & MEGA CREDENTIALS
 # ==========================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# NO GEMINI API KEY NEEDED ANYMORE! 🎉
 MEGA_EMAIL = os.environ.get("MEGA_EMAIL")
 MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD")
-
-# Naya SDK Initialisation
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Temp folders setup
 os.makedirs("output/audio", exist_ok=True)
 os.makedirs("output/images", exist_ok=True)
 
 # ==========================================
-# 2. ASK AI TO GENERATE SCRIPT & METADATA
+# 2. ASK QWEN (RUNNING LOCALLY ON GITHUB) TO GENERATE SCRIPT
 # ==========================================
-print("🧠 Asking AI to generate a viral script...")
+print("🧠 Asking Qwen to generate a viral script (This might take 3-5 mins on CPU)...")
 
 prompt = """
 You are an automated YouTube video engine for a doodle animation channel. 
@@ -50,14 +46,20 @@ Structure:
 Generate exactly 15 script_sections.
 """
 
-# ERROR FIXED: Officially using gemini-3.8-flash as demanded by Google's API
-response = client.models.generate_content(
-    model='gemini-3.8-flash', 
-    contents=prompt
-)
+# Call Ollama running on localhost inside the GitHub Server
+url = "http://localhost:11434/api/generate"
+payload = {
+    "model": "qwen2.5:3b",
+    "prompt": prompt,
+    "stream": False,
+    "format": "json" # Forces Qwen to reply in strict JSON
+}
+
+# Ye line wait karegi jab tak Qwen soch kar pura JSON na likh de
+qwen_response = requests.post(url, json=payload).json()
+raw_text = qwen_response['response']
 
 # Bulletproof JSON extraction
-raw_text = response.text
 start_idx = raw_text.find('{')
 end_idx = raw_text.rfind('}') + 1
 clean_json = raw_text[start_idx:end_idx]
@@ -69,24 +71,20 @@ print(f"🎬 Topic Selected: {data['video_title']}")
 # 3. GENERATE AUDIO, IMAGES & THUMBNAIL
 # ==========================================
 async def generate_assets():
-    # 1. Generate Thumbnail
     print("🖼️ Generating Thumbnail...")
     safe_thumb_prompt = urllib.parse.quote(data['thumbnail_prompt'])
     url = f"https://image.pollinations.ai/prompt/{safe_thumb_prompt}?width=1280&height=720&nologo=true"
     with open("output/thumbnail.png", 'wb') as handler:
         handler.write(requests.get(url).content)
 
-    # 2. Generate Scene Assets
     for i, section in enumerate(data['script_sections']):
         scene_num = str(i).zfill(3)
         print(f"Generating Audio & Image for Scene {scene_num}...")
         
-        # Audio
         audio_path = f"output/audio/scene_{scene_num}.mp3"
         communicate = edge_tts.Communicate(section['text'], "en-US-ChristopherNeural")
         await communicate.save(audio_path)
         
-        # Image
         image_path = f"output/images/scene_{scene_num}.png"
         safe_prompt = urllib.parse.quote(section['image_prompt'])
         url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1280&height=720&nologo=true"
@@ -114,16 +112,13 @@ for i in range(len(data['script_sections'])):
     audio_path = f"output/audio/scene_{scene_num}.mp3"
     image_path = f"output/images/scene_{scene_num}.png"
     
-    # Load audio and image, match image duration to audio
     audio_clip = AudioFileClip(audio_path)
     img_clip = ImageClip(image_path).set_duration(audio_clip.duration).set_audio(audio_clip)
     clips.append(img_clip)
 
-# Concatenate all clips and save as video.mp4
 final_video = concatenate_videoclips(clips, method="compose")
 final_video.write_videofile("output/video.mp4", fps=24, logger=None)
 
-# Close clips to free memory
 for clip in clips:
     clip.close()
 final_video.close()
@@ -137,7 +132,6 @@ m = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
 
 folder_name = "Latest_YouTube_Video"
 
-# Safe deletion of old folder (Crash Protection)
 print("🧹 Checking for old video files to delete...")
 try:
     old_folder = m.find(folder_name)
@@ -147,7 +141,6 @@ try:
 except Exception as e:
     print(f"No old folder found or skipped deletion: {e}")
 
-# Create fresh folder
 folder = m.create_folder(folder_name)
 folder_id = folder[folder_name]
 
@@ -156,4 +149,4 @@ m.upload('output/video.mp4', folder_id)
 m.upload('output/thumbnail.png', folder_id)
 m.upload('output/seo_and_description.txt', folder_id)
 
-print("✅ Workflow Complete! Aapka naya video aur assets Mega par aa chuke hain.")
+print("✅ Workflow Complete! Qwen ne laptop band hone ke baad bhi video bana di.")
