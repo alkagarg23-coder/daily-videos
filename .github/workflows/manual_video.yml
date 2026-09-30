@@ -29,13 +29,15 @@ jobs:
           ollama pull qwen2.5:3b
 
       - name: Install Python dependencies
-        # Ab humein google-genai ki zaroorat nahi hai
         run: |
-          pip install requests edge-tts mega.py moviepy==1.0.3 "Pillow<10.0.0"
+          # 1. Tenacity ka naya version (Python 3.11 fix) aur pycryptodome (Mega fix) install karo
+          pip install "tenacity>=8.2.2" pycryptodome requests edge-tts moviepy==1.0.3 "Pillow<10.0.0"
+          
+          # 2. Ab mega.py ko bina kisi purane kachre ke (no-dependencies) install karo
+          pip install mega.py --no-deps
 
       - name: Run Full Pipeline
         env:
-          # Sirf Mega ka email password chahiye, Gemini ki API key ab hata di!
           MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
           MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
         run: python pipeline.py
