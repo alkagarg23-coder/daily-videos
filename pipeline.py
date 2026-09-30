@@ -1,19 +1,19 @@
 import os
 import json
-import time
 import asyncio
 import urllib.parse
-from pathlib import Path
-
+import time
 import requests
 import edge_tts
+
+from io import BytesIO
 from PIL import Image
 from mega import Mega
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
 
 # ============================================================
-# 1. CONFIGURATION
+# CONFIG
 # ============================================================
 
 MEGA_EMAIL = os.environ.get("MEGA_EMAIL")
@@ -21,470 +21,728 @@ MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD")
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:3b"
+
 IMAGE_BASE_URL = "https://image.pollinations.ai/prompt/"
 VOICE = "en-US-ChristopherNeural"
 
-OUTPUT_DIR = Path("output")
-AUDIO_DIR = OUTPUT_DIR / "audio"
-IMAGE_DIR = OUTPUT_DIR / "images"
+OUTPUT_DIR = "output"
+AUDIO_DIR = os.path.join(OUTPUT_DIR, "audio")
+IMAGE_DIR = os.path.join(OUTPUT_DIR, "images")
 
-for folder in (OUTPUT_DIR, AUDIO_DIR, IMAGE_DIR):
-    folder.mkdir(parents=True, exist_ok=True)
+os.makedirs(AUDIO_DIR, exist_ok=True)
+os.makedirs(IMAGE_DIR, exist_ok=True)
 
 
 # ============================================================
-# 2. QWEN PROMPT
+# BASIC VALIDATION
 # ============================================================
 
-QWEN_PROMPT = r"""
+if not MEGA_EMAIL or not MEGA_PASSWORD:
+    raise RuntimeError(
+        "MEGA_EMAIL and MEGA_PASSWORD GitHub Secrets are required."
+    )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clean_json_text(raw_text):
+    """Extract JSON object even if model adds accidental text."""
+    start = raw_text.find("{")
+    end = raw_text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("Qwen did not return a valid JSON object.")
+
+    return raw_text[start:end + 1]
+
+
+def request_json(url, payload, retries=3):
+    """POST JSON with retries."""
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                timeout=600
+            )
+
+            response.raise_for_status()
+            return response.json()
+
+        except Exception as exc:
+            last_error = exc
+            print(
+                f"⚠️ Request failed "
+                f"(attempt {attempt}/{retries}): {exc}"
+            )
+
+            if attempt < retries:
+                time.sleep(5)
+
+    raise RuntimeError(
+        f"Request failed after {retries} attempts: {last_error}"
+    )
+
+
+def download_valid_png(prompt, output_path, retries=5):
+    """
+    Download image and make absolutely sure it is a real PNG.
+    This prevents MoviePy/Pillow from receiving HTML/error bytes.
+    """
+
+    encoded_prompt = urllib.parse.quote(prompt, safe="")
+
+    url = (
+        f"{IMAGE_BASE_URL}{encoded_prompt}"
+        "?width=1280"
+        "&height=720"
+        "&nologo=true"
+        "&model=flux"
+    )
+
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            print(
+                f"   🖼️ Image download "
+                f"attempt {attempt}/{retries}"
+            )
+
+            response = requests.get(
+                url,
+                timeout=180,
+                headers={
+                    "User-Agent": "Mozilla/5.0"
+                }
+            )
+
+            response.raise_for_status()
+
+            content = response.content
+
+            if len(content) < 1000:
+                raise ValueError(
+                    f"Image response too small: {len(content)} bytes"
+                )
+
+            # Decode image from memory.
+            with Image.open(BytesIO(content)) as img:
+                img.load()
+
+                # Always convert to RGB/RGBA-compatible PNG.
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGB")
+
+                img.save(
+                    output_path,
+                    format="PNG"
+                )
+
+            # Final validation.
+            with Image.open(output_path) as check:
+                check.verify()
+
+            print(f"   ✅ Valid PNG created: {output_path}")
+            return
+
+        except Exception as exc:
+            last_error = exc
+
+            print(
+                f"   ⚠️ Image generation failed: {exc}"
+            )
+
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+
+            if attempt < retries:
+                wait_time = attempt * 5
+                print(
+                    f"   ⏳ Retrying in {wait_time} seconds..."
+                )
+                time.sleep(wait_time)
+
+    raise RuntimeError(
+        f"Could not create valid image after "
+        f"{retries} attempts: {last_error}"
+    )
+
+
+async def generate_audio(text, output_path, retries=5):
+    """Generate Edge TTS audio with retries."""
+
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            print(
+                f"   🔊 Audio attempt {attempt}/{retries}"
+            )
+
+            communicate = edge_tts.Communicate(
+                text,
+                VOICE
+            )
+
+            await communicate.save(output_path)
+
+            if not os.path.exists(output_path):
+                raise RuntimeError(
+                    "Audio file was not created."
+                )
+
+            if os.path.getsize(output_path) < 1000:
+                raise RuntimeError(
+                    "Audio file is suspiciously small."
+                )
+
+            print(f"   ✅ Audio created: {output_path}")
+            return
+
+        except Exception as exc:
+            last_error = exc
+
+            print(
+                f"   ⚠️ Audio generation failed: {exc}"
+            )
+
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+
+            if attempt < retries:
+                wait_time = attempt * 3
+                print(
+                    f"   ⏳ Retrying in {wait_time} seconds..."
+                )
+                await asyncio.sleep(wait_time)
+
+    raise RuntimeError(
+        f"Could not generate audio after "
+        f"{retries} attempts: {last_error}"
+    )
+
+
+# ============================================================
+# QWEN SCRIPT GENERATION
+# ============================================================
+
+print("=" * 60)
+print("🧠 ASKING QWEN TO CREATE STICKMAN FINANCE VIDEO")
+print("=" * 60)
+
+prompt = """
 You are an automated YouTube video engine for a Stickman Finance channel.
 
-NICHE:
-Educational, entertaining personal-finance and money-psychology content
-explained with simple stickman characters.
+Create one highly engaging YouTube video about personal finance,
+money psychology, investing basics, saving, debt, income,
+financial mistakes, wealth building, or behavioral finance.
 
-Choose ONE highly engaging topic. Possible topics include:
-- budgeting
-- saving
-- debt
-- compound interest
-- inflation
-- investing concepts
-- financial mistakes
-- money psychology
-- lifestyle inflation
-- emergency funds
-- credit
-- scams and financial traps
-- wealth-building principles
-- financial independence
+The audience should be ordinary people who want to understand money
+in a simple and entertaining way.
 
-Do not provide personalized financial advice.
-Do not promise profits or guaranteed investment returns.
+STYLE:
+- Stickman Finance
+- Simple 2D stickman cartoon
+- White/light background
+- Bold black outlines
+- Flat colors
+- Minimal visual clutter
+- Clear visual storytelling
+- No realistic humans
+- No gradients
+- No photographic style
+- No complicated charts unless absolutely necessary
 
 NARRATION:
-- Calm, conversational second-person narration.
-- Simple English.
-- Short sentences.
-- Each section should normally contain 1-3 short sentences.
-- Build a clear story: hook -> explanation -> examples -> conclusion.
+- Calm but engaging
+- Easy English
+- Short sentences
+- Second-person style where appropriate
+- Each section should normally contain 1-3 short sentences
+- Every section must move the story forward
 
-VISUAL STYLE:
-- Hand-drawn 2D stickman finance cartoon.
-- White/light background.
-- Bold black outlines.
-- Flat colors.
-- Simple objects and backgrounds.
-- Clear visual storytelling.
-- No gradients.
-- No photorealism.
-- No realistic humans.
-- No text-heavy images.
-- 16:9 YouTube composition.
+IMPORTANT:
+DO NOT use a fixed scene count.
 
-SCENE COUNT:
-There is NO fixed scene count.
-Choose however many scenes are actually needed to tell the story properly.
-Do NOT target 15.
-Do NOT target 20.
-Do NOT pad or truncate the story to hit a fixed number.
+Choose the number of script_sections naturally based on the story.
+It may be 8, 11, 17, 23, 30, or any other reasonable number.
 
-Every item in script_sections becomes exactly one audio clip,
-one image, and one video scene.
+The automation will create EXACTLY:
+1 audio file per script section
+1 image per script section
+1 video clip per script section
 
-Return ONLY valid JSON, with no markdown and no explanation.
+Therefore every script_sections item must contain both text and image_prompt.
 
-Required JSON structure:
+Return ONLY valid JSON.
+No markdown.
+No explanation before or after JSON.
+
+Required structure:
+
 {
-  "video_title": "Viral title under 70 characters",
-  "seo_tags": "tag1, tag2, tag3",
-  "description": "YouTube description with hook, useful context, CTA, and relevant hashtags",
-  "thumbnail_prompt": "Detailed stickman finance thumbnail prompt",
+  "video_title": "YouTube title under 70 characters",
+  "seo_tags": "tag1, tag2, tag3, tag4",
+  "description": "A compelling YouTube description with a hook, useful context, CTA, and hashtags.",
+  "thumbnail_prompt": "Stickman Finance thumbnail scene representing the title, bold black outlines, flat colors, dramatic but clean composition, YouTube thumbnail style",
   "script_sections": [
     {
-      "text": "Narration for this scene",
-      "image_prompt": "Detailed visual prompt for this scene"
+      "text": "Narration for this scene.",
+      "image_prompt": "Detailed Stickman Finance visual scene for this narration."
     }
   ]
 }
 
-Requirements:
-- script_sections must contain at least 1 item.
-- Every item must have non-empty text.
-- Every item must have non-empty image_prompt.
-- Each section should move the story forward.
+Make the story complete from beginning to end.
+Do not create empty sections.
+Do not number the sections.
+Do not put multiple scenes inside one script_sections item.
 """
 
+payload = {
+    "model": OLLAMA_MODEL,
+    "prompt": prompt,
+    "stream": False,
+    "format": "json"
+}
 
-# ============================================================
-# 3. HELPERS
-# ============================================================
+print("⏳ Qwen is generating the script...")
 
-def fail(message):
-    raise RuntimeError(message)
+qwen_response = request_json(
+    OLLAMA_URL,
+    payload,
+    retries=3
+)
 
+if "response" not in qwen_response:
+    raise RuntimeError(
+        "Ollama response did not contain 'response'."
+    )
 
-def scene_paths(index):
-    scene = str(index).zfill(3)
-    return (
-        AUDIO_DIR / f"scene_{scene}.mp3",
-        IMAGE_DIR / f"scene_{scene}.png",
+raw_text = qwen_response["response"]
+
+clean_json = clean_json_text(raw_text)
+
+try:
+    data = json.loads(clean_json)
+except json.JSONDecodeError as exc:
+    raise RuntimeError(
+        f"Qwen returned invalid JSON: {exc}"
     )
 
 
-def parse_qwen_json(raw_text):
-    raw_text = (raw_text or "").strip()
-    start = raw_text.find("{")
-    end = raw_text.rfind("}") + 1
+# ============================================================
+# VALIDATE SCRIPT
+# ============================================================
 
-    if start < 0 or end <= start:
-        fail(
-            "Qwen did not return a JSON object.\n"
-            f"Response:\n{raw_text[:3000]}"
+required_fields = [
+    "video_title",
+    "seo_tags",
+    "description",
+    "thumbnail_prompt",
+    "script_sections"
+]
+
+for field in required_fields:
+    if field not in data:
+        raise RuntimeError(
+            f"Qwen JSON is missing required field: {field}"
         )
 
-    try:
-        data = json.loads(raw_text[start:end])
-    except json.JSONDecodeError as exc:
-        fail(
-            f"Qwen returned invalid JSON: {exc}\n"
-            f"Response:\n{raw_text[:3000]}"
+
+sections = data["script_sections"]
+
+if not isinstance(sections, list):
+    raise RuntimeError(
+        "script_sections must be a list."
+    )
+
+if len(sections) == 0:
+    raise RuntimeError(
+        "Qwen generated zero script sections."
+    )
+
+
+for index, section in enumerate(sections):
+    if not isinstance(section, dict):
+        raise RuntimeError(
+            f"Scene {index} is not a JSON object."
         )
 
-    required = (
-        "video_title",
-        "seo_tags",
-        "description",
-        "thumbnail_prompt",
-        "script_sections",
-    )
-    missing = [key for key in required if key not in data]
-    if missing:
-        fail(f"Qwen JSON is missing: {missing}")
-
-    sections = data["script_sections"]
-    if not isinstance(sections, list) or not sections:
-        fail("Qwen returned an empty script_sections list.")
-
-    clean_sections = []
-    for number, section in enumerate(sections, start=1):
-        if not isinstance(section, dict):
-            fail(f"Scene {number} is not a JSON object.")
-
-        text = str(section.get("text", "")).strip()
-        image_prompt = str(section.get("image_prompt", "")).strip()
-
-        if not text:
-            fail(f"Scene {number} has empty narration.")
-        if not image_prompt:
-            fail(f"Scene {number} has an empty image prompt.")
-
-        clean_sections.append({
-            "text": text,
-            "image_prompt": image_prompt,
-        })
-
-    data["script_sections"] = clean_sections
-    return data
-
-
-def download_and_normalize_image(prompt_text, destination, width=1280, height=720, attempts=4):
-    encoded = urllib.parse.quote(prompt_text, safe="")
-    url = (
-        f"{IMAGE_BASE_URL}{encoded}"
-        f"?width={width}&height={height}&nologo=true"
-    )
-
-    temp = destination.with_suffix(".download")
-    last_error = None
-
-    for attempt in range(1, attempts + 1):
-        try:
-            response = requests.get(
-                url,
-                timeout=(30, 180),
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            response.raise_for_status()
-
-            content = response.content
-            content_type = response.headers.get("Content-Type", "").lower()
-
-            if len(content) < 1024:
-                raise ValueError(
-                    f"response too small ({len(content)} bytes), "
-                    f"content-type={content_type}"
-                )
-
-            temp.write_bytes(content)
-
-            # Decode whatever format the service returned and write
-            # a genuine PNG. This prevents MoviePy/Pillow format errors.
-            with Image.open(temp) as source:
-                source.load()
-                if source.width < 2 or source.height < 2:
-                    raise ValueError("image dimensions are invalid")
-
-                converted = (
-                    source.convert("RGBA")
-                    if source.mode in ("RGBA", "LA", "P")
-                    else source.convert("RGB")
-                )
-                converted.save(temp, format="PNG")
-
-            with Image.open(temp) as check:
-                check.load()
-                if check.format != "PNG":
-                    raise ValueError("normalized file is not PNG")
-
-            temp.replace(destination)
-            return
-
-        except Exception as exc:
-            last_error = exc
-            if temp.exists():
-                temp.unlink()
-            print(
-                f"   ⚠️ image attempt {attempt}/{attempts} failed: {exc}",
-                flush=True,
-            )
-            if attempt < attempts:
-                time.sleep(attempt * 3)
-
-    fail(f"Could not create valid image after {attempts} attempts: {last_error}")
-
-
-async def generate_audio(text, destination, attempts=3):
-    last_error = None
-
-    for attempt in range(1, attempts + 1):
-        try:
-            if destination.exists():
-                destination.unlink()
-
-            communicate = edge_tts.Communicate(text, VOICE)
-            await communicate.save(str(destination))
-
-            if not destination.exists() or destination.stat().st_size < 1000:
-                raise ValueError("audio file is missing or suspiciously small")
-
-            return
-
-        except Exception as exc:
-            last_error = exc
-            print(
-                f"   ⚠️ audio attempt {attempt}/{attempts} failed: {exc}",
-                flush=True,
-            )
-            if attempt < attempts:
-                await asyncio.sleep(attempt * 2)
-
-    fail(f"Could not create audio after {attempts} attempts: {last_error}")
-
-
-# ============================================================
-# 4. GENERATE SCRIPT WITH OLLAMA
-# ============================================================
-
-def generate_script():
-    print("🧠 Asking Qwen for a Stickman Finance script...", flush=True)
-
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": QWEN_PROMPT,
-        "stream": False,
-        "format": "json",
-    }
-
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json=payload,
-            timeout=900,
+    if not section.get("text"):
+        raise RuntimeError(
+            f"Scene {index} has no narration text."
         )
-        response.raise_for_status()
-        result = response.json()
-    except Exception as exc:
-        fail(f"Ollama/Qwen request failed: {exc}")
 
-    raw = result.get("response", "")
-    data = parse_qwen_json(raw)
+    if not section.get("image_prompt"):
+        raise RuntimeError(
+            f"Scene {index} has no image prompt."
+        )
 
-    print(f"🎬 Topic: {data['video_title']}", flush=True)
-    print(
-        f"🎞️ Qwen generated {len(data['script_sections'])} scenes. "
-        "ALL will be processed.",
-        flush=True,
-    )
 
-    return data
+SCENE_COUNT = len(sections)
+
+print()
+print("=" * 60)
+print(f"🎬 TITLE: {data['video_title']}")
+print(f"🎞️ DYNAMIC SCENE COUNT: {SCENE_COUNT}")
+print("=" * 60)
+print()
 
 
 # ============================================================
-# 5. GENERATE THUMBNAIL + ALL SCENE ASSETS
+# GENERATE THUMBNAIL
 # ============================================================
 
-async def generate_assets(data):
-    print("🖼️ Generating thumbnail...", flush=True)
-    download_and_normalize_image(
-        data["thumbnail_prompt"],
-        OUTPUT_DIR / "thumbnail.png",
-    )
+print("🖼️ Generating thumbnail...")
 
-    total = len(data["script_sections"])
+thumbnail_path = os.path.join(
+    OUTPUT_DIR,
+    "thumbnail.png"
+)
 
-    for index, section in enumerate(data["script_sections"]):
-        audio_path, image_path = scene_paths(index)
+download_valid_png(
+    data["thumbnail_prompt"],
+    thumbnail_path,
+    retries=5
+)
+
+
+# ============================================================
+# GENERATE EXACTLY N AUDIO + IMAGE FILES
+# ============================================================
+
+async def generate_all_assets():
+
+    for index, section in enumerate(sections):
+
+        scene_number = str(index).zfill(3)
+
+        audio_path = os.path.join(
+            AUDIO_DIR,
+            f"scene_{scene_number}.mp3"
+        )
+
+        image_path = os.path.join(
+            IMAGE_DIR,
+            f"scene_{scene_number}.png"
+        )
+
+        print()
+        print(
+            f"🎬 SCENE {index + 1}/{SCENE_COUNT}"
+        )
+        print("-" * 50)
+
+        await generate_audio(
+            section["text"],
+            audio_path
+        )
+
+        download_valid_png(
+            section["image_prompt"],
+            image_path
+        )
 
         print(
-            f"🎨 Scene {index + 1}/{total}: "
-            "generating audio + image...",
-            flush=True,
-        )
-
-        await generate_audio(section["text"], audio_path)
-        download_and_normalize_image(
-            section["image_prompt"],
-            image_path,
+            f"✅ Scene {index + 1}/{SCENE_COUNT} complete"
         )
 
 
-# ============================================================
-# 6. SEO FILE
-# ============================================================
+print("=" * 60)
+print("🎨 GENERATING AUDIO + IMAGES")
+print("=" * 60)
 
-def create_seo_file(data):
-    print("📝 Creating SEO file...", flush=True)
-
-    seo_path = OUTPUT_DIR / "seo_and_description.txt"
-    with seo_path.open("w", encoding="utf-8") as file:
-        file.write(f"TITLE:\n{data['video_title']}\n\n")
-        file.write(f"DESCRIPTION:\n{data['description']}\n\n")
-        file.write(f"TAGS:\n{data['seo_tags']}\n\n")
-        file.write(
-            f"SCENE_COUNT:\n{len(data['script_sections'])}\n"
-        )
+asyncio.run(generate_all_assets())
 
 
 # ============================================================
-# 7. BUILD VIDEO FROM EXACT SCENE COUNT
+# SEO FILE
 # ============================================================
 
-def build_video(data):
-    print("🎞️ Assembling final video...", flush=True)
+print()
+print("📝 Creating SEO file...")
 
-    clips = []
-    final_video = None
+seo_path = os.path.join(
+    OUTPUT_DIR,
+    "seo_and_description.txt"
+)
 
-    try:
-        total = len(data["script_sections"])
+with open(
+    seo_path,
+    "w",
+    encoding="utf-8"
+) as file:
 
-        for index in range(total):
-            audio_path, image_path = scene_paths(index)
+    file.write(
+        f"TITLE:\n{data['video_title']}\n\n"
+    )
 
-            if not audio_path.exists():
-                fail(f"Missing audio: {audio_path}")
-            if not image_path.exists():
-                fail(f"Missing image: {image_path}")
+    file.write(
+        f"DESCRIPTION:\n{data['description']}\n\n"
+    )
 
-            # Validate the actual image immediately before MoviePy.
-            try:
-                with Image.open(image_path) as image:
-                    image.load()
-            except Exception as exc:
-                fail(f"Invalid/corrupt image {image_path}: {exc}")
+    file.write(
+        f"TAGS:\n{data['seo_tags']}\n\n"
+    )
 
-            audio_clip = AudioFileClip(str(audio_path))
-            image_clip = (
-                ImageClip(str(image_path))
-                .set_duration(audio_clip.duration)
-                .set_audio(audio_clip)
-            )
-            clips.append(image_clip)
-
-        if not clips:
-            fail("No clips were created.")
-
-        final_video = concatenate_videoclips(clips, method="compose")
-        final_video.write_videofile(
-            str(OUTPUT_DIR / "video.mp4"),
-            fps=24,
-            codec="libx264",
-            audio_codec="aac",
-            logger=None,
-        )
-
-        print(f"✅ Video assembled from exactly {total} scenes.", flush=True)
-
-    finally:
-        for clip in clips:
-            try:
-                clip.close()
-            except Exception:
-                pass
-
-        if final_video is not None:
-            try:
-                final_video.close()
-            except Exception:
-                pass
-
-
-# ============================================================
-# 8. UPLOAD TO MEGA
-# ============================================================
-
-def upload_to_mega():
-    if not MEGA_EMAIL or not MEGA_PASSWORD:
-        fail("MEGA_EMAIL or MEGA_PASSWORD is not set.")
-
-    print("☁️ Connecting to Mega...", flush=True)
-
-    mega = Mega()
-    client = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
-
-    folder_name = "Latest_YouTube_Video"
-
-    print("🧹 Removing previous output folder if present...", flush=True)
-    try:
-        old_folder = client.find(folder_name)
-        if old_folder:
-            client.destroy(old_folder[0])
-            print("🗑️ Previous folder deleted.", flush=True)
-    except Exception as exc:
-        print(f"ℹ️ Old folder cleanup skipped: {exc}", flush=True)
-
-    print("📁 Creating new Mega folder...", flush=True)
-    folder = client.create_folder(folder_name)
-    folder_id = folder[folder_name]
-
-    print("🚀 Uploading video, thumbnail and SEO file...", flush=True)
-
-    client.upload(str(OUTPUT_DIR / "video.mp4"), folder_id)
-    client.upload(str(OUTPUT_DIR / "thumbnail.png"), folder_id)
-    client.upload(str(OUTPUT_DIR / "seo_and_description.txt"), folder_id)
-
-    print("✅ Mega upload complete.", flush=True)
-
-
-# ============================================================
-# 9. MAIN
-# ============================================================
-
-def main():
-    data = generate_script()
-
-    asyncio.run(generate_assets(data))
-    create_seo_file(data)
-    build_video(data)
-    upload_to_mega()
-
-    print(
-        f"🎉 WORKFLOW COMPLETE — "
-        f"{len(data['script_sections'])} scenes generated.",
-        flush=True,
+    file.write(
+        f"SCENE_COUNT:\n{SCENE_COUNT}\n"
     )
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# FINAL VALIDATION BEFORE MOVIEPY
+# ============================================================
+
+print()
+print("=" * 60)
+print("🔍 VALIDATING GENERATED ASSETS")
+print("=" * 60)
+
+for index in range(SCENE_COUNT):
+
+    scene_number = str(index).zfill(3)
+
+    audio_path = os.path.join(
+        AUDIO_DIR,
+        f"scene_{scene_number}.mp3"
+    )
+
+    image_path = os.path.join(
+        IMAGE_DIR,
+        f"scene_{scene_number}.png"
+    )
+
+    if not os.path.isfile(audio_path):
+        raise RuntimeError(
+            f"Missing audio: {audio_path}"
+        )
+
+    if not os.path.isfile(image_path):
+        raise RuntimeError(
+            f"Missing image: {image_path}"
+        )
+
+    if os.path.getsize(audio_path) < 1000:
+        raise RuntimeError(
+            f"Invalid/empty audio: {audio_path}"
+        )
+
+    try:
+        with Image.open(image_path) as img:
+            img.verify()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Invalid PNG: {image_path}: {exc}"
+        )
+
+    print(
+        f"✅ Scene {index + 1}/{SCENE_COUNT} assets valid"
+    )
+
+
+# ============================================================
+# BUILD VIDEO
+# ============================================================
+
+print()
+print("=" * 60)
+print("🎞️ ASSEMBLING FINAL VIDEO")
+print("=" * 60)
+
+clips = []
+final_video = None
+
+try:
+
+    for index in range(SCENE_COUNT):
+
+        scene_number = str(index).zfill(3)
+
+        audio_path = os.path.join(
+            AUDIO_DIR,
+            f"scene_{scene_number}.mp3"
+        )
+
+        image_path = os.path.join(
+            IMAGE_DIR,
+            f"scene_{scene_number}.png"
+        )
+
+        print(
+            f"🎞️ Building clip "
+            f"{index + 1}/{SCENE_COUNT}"
+        )
+
+        audio_clip = AudioFileClip(
+            audio_path
+        )
+
+        image_clip = (
+            ImageClip(image_path)
+            .set_duration(audio_clip.duration)
+            .set_audio(audio_clip)
+        )
+
+        clips.append(image_clip)
+
+
+    print("🔗 Joining all scenes...")
+
+    final_video = concatenate_videoclips(
+        clips,
+        method="compose"
+    )
+
+    video_path = os.path.join(
+        OUTPUT_DIR,
+        "video.mp4"
+    )
+
+    print("💾 Writing video.mp4...")
+
+    final_video.write_videofile(
+        video_path,
+        fps=24,
+        codec="libx264",
+        audio_codec="aac",
+        threads=2,
+        logger="bar"
+    )
+
+finally:
+
+    for clip in clips:
+        try:
+            clip.close()
+        except Exception:
+            pass
+
+    if final_video is not None:
+        try:
+            final_video.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# FINAL VIDEO CHECK
+# ============================================================
+
+video_path = os.path.join(
+    OUTPUT_DIR,
+    "video.mp4"
+)
+
+if not os.path.isfile(video_path):
+    raise RuntimeError(
+        "Final video was not created."
+    )
+
+if os.path.getsize(video_path) < 10000:
+    raise RuntimeError(
+        "Final video file is suspiciously small."
+    )
+
+
+# ============================================================
+# UPLOAD TO MEGA
+# ============================================================
+
+print()
+print("=" * 60)
+print("☁️ UPLOADING TO MEGA")
+print("=" * 60)
+
+mega = Mega()
+
+print("🔐 Logging into Mega...")
+
+m = mega.login(
+    MEGA_EMAIL,
+    MEGA_PASSWORD
+)
+
+folder_name = "Latest_YouTube_Video"
+
+print("🧹 Removing previous Latest_YouTube_Video folder...")
+
+try:
+
+    old_folder = m.find(folder_name)
+
+    if old_folder:
+        for folder in old_folder:
+            try:
+                m.destroy(folder)
+                print("🗑️ Old folder deleted.")
+            except Exception as exc:
+                print(
+                    f"⚠️ Could not delete old folder: {exc}"
+                )
+
+except Exception as exc:
+
+    print(
+        f"⚠️ Old folder lookup skipped: {exc}"
+    )
+
+
+print("📁 Creating new Mega folder...")
+
+folder = m.create_folder(
+    folder_name
+)
+
+folder_id = folder[folder_name]
+
+
+print("🚀 Uploading video...")
+
+m.upload(
+    video_path,
+    folder_id
+)
+
+print("🚀 Uploading thumbnail...")
+
+m.upload(
+    thumbnail_path,
+    folder_id
+)
+
+print("🚀 Uploading SEO file...")
+
+m.upload(
+    seo_path,
+    folder_id
+)
+
+
+# ============================================================
+# COMPLETE
+# ============================================================
+
+print()
+print("=" * 60)
+print("✅ AUTOMATION COMPLETE")
+print("=" * 60)
+print(f"🎬 Title: {data['video_title']}")
+print(f"🎞️ Scenes: {SCENE_COUNT}")
+print("🔊 Audio files: generated dynamically")
+print("🖼️ Images: generated dynamically")
+print("🎞️ Video clips: generated dynamically")
+print("☁️ Mega upload: complete")
+print("=" * 60)
