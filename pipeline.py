@@ -2,12 +2,12 @@ import os
 import json
 import asyncio
 import re
-import shutil
+import urllib.parse
+import requests
 import edge_tts
 import google.generativeai as genai
 from mega import Mega
-from diffusers import StableDiffusionPipeline
-import torch
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
 # ==========================================
 # 1. SETUP & API KEYS
@@ -18,19 +18,19 @@ MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Temp folders banana
+# Create temp folders
 os.makedirs("output/audio", exist_ok=True)
 os.makedirs("output/images", exist_ok=True)
 
 # ==========================================
-# 2. ASK AI TO THINK OF A TOPIC & SCRIPT
+# 2. ASK AI TO GENERATE SCRIPT & METADATA
 # ==========================================
 print("🧠 Asking AI to generate a viral script...")
 
 prompt = """
 You are an automated YouTube video engine for a doodle animation channel. 
-Pick a RANDOM, highly engaging, unheard-of topic in human history, psychology, or evolution.
-Format: Calm 2nd-person narration. No jargon.
+Pick a RANDOM, highly engaging topic in human history, psychology, or evolution.
+Format: Calm 2nd-person narration. Short sentences.
 Visuals: Hand-drawn 2D doodle cartoon, flat colors, bold outlines, NO gradients/shadows.
 
 Return ONLY a valid JSON object. No markdown. Structure:
@@ -38,79 +38,107 @@ Return ONLY a valid JSON object. No markdown. Structure:
   "video_title": "[Viral title under 70 characters]",
   "seo_tags": "tag1, tag2, tag3",
   "description": "[3-sentence hook, CTA, 15 hashtags]",
+  "thumbnail_prompt": "Hand-drawn 2D doodle cartoon, very catchy and dramatic scene representing the title, bold black outlines, flat colors, white background, YouTube thumbnail style",
   "script_sections": [
     {
       "text": "[Narration text max 2 sentences]",
-      "image_prompt": "Hand-drawn 2D doodle cartoon animation, [SCENE DESC], flat colors, bold black outlines, educational doodle style"
+      "image_prompt": "Hand-drawn 2D doodle cartoon animation, [SCENE DESC], flat colors, bold black outlines"
     }
   ]
 }
-Make sure to generate at least 25 script_sections for a good length video.
+Generate exactly 15 script_sections.
 """
 
 model = genai.GenerativeModel('gemini-1.5-pro')
 response = model.generate_content(prompt)
 
-# Clean JSON output (remove ```json tags if AI adds them)
-raw_text = response.text
-clean_json = re.sub(r'```json|```', '', raw_text).strip()
+clean_json = re.sub(r'```json|```', '', response.text).strip()
 data = json.loads(clean_json)
 
 print(f"🎬 Topic Selected: {data['video_title']}")
 
 # ==========================================
-# 3. GENERATE MEDIA (AUDIO + IMAGES)
+# 3. GENERATE AUDIO, IMAGES & THUMBNAIL
 # ==========================================
-print("🎨 Loading Image Generator (Stable Diffusion)...")
-pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16)
-pipe = pipe.to("cuda") # Ensure GPU is used
-
 async def generate_assets():
+    # 1. Generate Thumbnail
+    print("🖼️ Generating Thumbnail...")
+    safe_thumb_prompt = urllib.parse.quote(data['thumbnail_prompt'])
+    url = f"https://image.pollinations.ai/prompt/{safe_thumb_prompt}?width=1280&height=720&nologo=true"
+    with open("output/thumbnail.png", 'wb') as handler:
+        handler.write(requests.get(url).content)
+
+    # 2. Generate Scene Assets
     for i, section in enumerate(data['script_sections']):
         scene_num = str(i).zfill(3)
-        print(f"Generating Scene {scene_num}...")
+        print(f"Generating Audio & Image for Scene {scene_num}...")
         
-        # Audio (Edge-TTS)
+        # Audio
         audio_path = f"output/audio/scene_{scene_num}.mp3"
         communicate = edge_tts.Communicate(section['text'], "en-US-ChristopherNeural")
         await communicate.save(audio_path)
         
-        # Image (Stable Diffusion)
+        # Image
         image_path = f"output/images/scene_{scene_num}.png"
-        image = pipe(section['image_prompt'], num_inference_steps=25).images[0]
-        image.save(image_path)
+        safe_prompt = urllib.parse.quote(section['image_prompt'])
+        url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1280&height=720&nologo=true"
+        with open(image_path, 'wb') as handler:
+            handler.write(requests.get(url).content)
 
 asyncio.run(generate_assets())
 
-# Write Metadata text file
-with open('output/metadata.txt', 'w', encoding='utf-8') as f:
-    f.write(f"TITLE: {data['video_title']}\n\nDESC: {data['description']}\n\nTAGS: {data['seo_tags']}")
+# ==========================================
+# 4. CREATE SEO TEXT FILE
+# ==========================================
+print("📝 Creating SEO file...")
+with open('output/seo_and_description.txt', 'w', encoding='utf-8') as f:
+    f.write(f"TITLE:\n{data['video_title']}\n\n")
+    f.write(f"DESCRIPTION:\n{data['description']}\n\n")
+    f.write(f"TAGS:\n{data['seo_tags']}")
 
 # ==========================================
-# 4. UPLOAD TO MEGA DRIVE
+# 5. STITCH AUDIO & IMAGES INTO VIDEO (.MP4)
+# ==========================================
+print("🎞️ Assembling Final Video...")
+clips = []
+for i in range(len(data['script_sections'])):
+    scene_num = str(i).zfill(3)
+    audio_path = f"output/audio/scene_{scene_num}.mp3"
+    image_path = f"output/images/scene_{scene_num}.png"
+    
+    # Load audio and image, match image duration to audio
+    audio_clip = AudioFileClip(audio_path)
+    img_clip = ImageClip(image_path).set_duration(audio_clip.duration).set_audio(audio_clip)
+    clips.append(img_clip)
+
+# Concatenate all clips and save as video.mp4
+final_video = concatenate_videoclips(clips, method="compose")
+# logger=None prevents output clutter in GitHub Actions logs
+final_video.write_videofile("output/video.mp4", fps=24, logger=None)
+
+# ==========================================
+# 6. UPLOAD TO MEGA & CLEANUP OLD FILES
 # ==========================================
 print("☁️ Connecting to Mega...")
 mega = Mega()
 m = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
 
-folder_name = data['video_title'].replace('/', '-').replace(':', '')[:40] # Safe folder name
+folder_name = "Latest_YouTube_Video"
+
+# Check if folder exists from previous run, if yes, delete it (Clean up)
+print("🧹 Checking for old video files to delete...")
+existing_folder = m.find(folder_name)
+if existing_folder:
+    m.destroy(existing_folder[0]) # Deletes the folder and its 3 files
+    print("🗑️ Old files deleted.")
+
+# Create fresh folder
 folder = m.create_folder(folder_name)
 folder_id = folder[folder_name]
 
-print("🚀 Uploading files to Mega...")
-m.upload('output/metadata.txt', folder_id)
+print("🚀 Uploading new Video, Thumbnail, and SEO TXT to Mega...")
+m.upload('output/video.mp4', folder_id)
+m.upload('output/thumbnail.png', folder_id)
+m.upload('output/seo_and_description.txt', folder_id)
 
-for file in os.listdir('output/audio'):
-    m.upload(f'output/audio/{file}', folder_id)
-
-for file in os.listdir('output/images'):
-    m.upload(f'output/images/{file}', folder_id)
-
-print("✅ Upload Complete!")
-
-# ==========================================
-# 5. CLEANUP (To save PC Storage)
-# ==========================================
-print("🧹 Cleaning up local files...")
-shutil.rmtree('output')
-print("🎉 All Done! See you tomorrow.")
+print("✅ Workflow Complete! Aapka naya video Mega me ready hai.")
