@@ -50,9 +50,9 @@ Structure:
 Generate exactly 15 script_sections.
 """
 
-# YAHAN LATEST VERSION LAGA DIYA HAI 🔥
+# ERROR FIXED: Officially using gemini-3.8-flash as demanded by Google's API
 response = client.models.generate_content(
-    model='gemini-2.5-flash', 
+    model='gemini-3.8-flash', 
     contents=prompt
 )
 
