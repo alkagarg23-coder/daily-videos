@@ -1,11 +1,10 @@
 import os
 import json
 import asyncio
-import re
 import urllib.parse
 import requests
 import edge_tts
-import google.generativeai as genai
+from google import genai
 from mega import Mega
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
@@ -16,9 +15,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MEGA_EMAIL = os.environ.get("MEGA_EMAIL")
 MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD")
 
-genai.configure(api_key=GEMINI_API_KEY)
+# Naya SDK Initialisation
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Create temp folders
+# Temp folders setup
 os.makedirs("output/audio", exist_ok=True)
 os.makedirs("output/images", exist_ok=True)
 
@@ -33,7 +33,8 @@ Pick a RANDOM, highly engaging topic in human history, psychology, or evolution.
 Format: Calm 2nd-person narration. Short sentences.
 Visuals: Hand-drawn 2D doodle cartoon, flat colors, bold outlines, NO gradients/shadows.
 
-Return ONLY a valid JSON object. No markdown. Structure:
+Return ONLY a valid JSON object starting with { and ending with }. No markdown, no explanations. 
+Structure:
 {
   "video_title": "[Viral title under 70 characters]",
   "seo_tags": "tag1, tag2, tag3",
@@ -49,12 +50,18 @@ Return ONLY a valid JSON object. No markdown. Structure:
 Generate exactly 15 script_sections.
 """
 
-model = genai.GenerativeModel('gemini-1.5-pro')
-response = model.generate_content(prompt)
+response = client.models.generate_content(
+    model='gemini-1.5-pro',
+    contents=prompt
+)
 
-clean_json = re.sub(r'```json|```', '', response.text).strip()
+# Bulletproof JSON extraction
+raw_text = response.text
+start_idx = raw_text.find('{')
+end_idx = raw_text.rfind('}') + 1
+clean_json = raw_text[start_idx:end_idx]
+
 data = json.loads(clean_json)
-
 print(f"🎬 Topic Selected: {data['video_title']}")
 
 # ==========================================
@@ -113,8 +120,12 @@ for i in range(len(data['script_sections'])):
 
 # Concatenate all clips and save as video.mp4
 final_video = concatenate_videoclips(clips, method="compose")
-# logger=None prevents output clutter in GitHub Actions logs
 final_video.write_videofile("output/video.mp4", fps=24, logger=None)
+
+# Close clips to free memory
+for clip in clips:
+    clip.close()
+final_video.close()
 
 # ==========================================
 # 6. UPLOAD TO MEGA & CLEANUP OLD FILES
@@ -125,12 +136,15 @@ m = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
 
 folder_name = "Latest_YouTube_Video"
 
-# Check if folder exists from previous run, if yes, delete it (Clean up)
+# Safe deletion of old folder (Crash Protection)
 print("🧹 Checking for old video files to delete...")
-existing_folder = m.find(folder_name)
-if existing_folder:
-    m.destroy(existing_folder[0]) # Deletes the folder and its 3 files
-    print("🗑️ Old files deleted.")
+try:
+    old_folder = m.find(folder_name)
+    if old_folder:
+        m.destroy(old_folder[0])
+        print("🗑️ Old files deleted.")
+except Exception as e:
+    print(f"No old folder found or skipped deletion: {e}")
 
 # Create fresh folder
 folder = m.create_folder(folder_name)
@@ -141,4 +155,4 @@ m.upload('output/video.mp4', folder_id)
 m.upload('output/thumbnail.png', folder_id)
 m.upload('output/seo_and_description.txt', folder_id)
 
-print("✅ Workflow Complete! Aapka naya video Mega me ready hai.")
+print("✅ Workflow Complete! Aapka naya video aur assets Mega par aa chuke hain.")
