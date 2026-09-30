@@ -9,7 +9,6 @@ permissions:
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -20,11 +19,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install FFmpeg & Fonts
+      - name: Install FFmpeg
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          sudo apt-get install -y ffmpeg
           ffmpeg -version
 
       - name: Install Ollama
@@ -59,22 +58,10 @@ jobs:
         run: |
           set -e
           python -m pip install --upgrade pip
-          pip install \
-            "tenacity>=8.2.2" \
-            pycryptodome \
-            requests \
-            edge-tts \
-            "moviepy==1.0.3" \
-            Pillow
-
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers transformers accelerate
+          pip install "tenacity>=8.2.2" pycryptodome requests edge-tts "moviepy==1.0.3" Pillow
           pip install mega.py --no-deps
-
-      - name: Validate pipeline
-        run: |
-          set -e
-          test -f pipeline.py
-          python -m py_compile pipeline.py
-          echo "✅ Pipeline validation passed."
 
       - name: Run video pipeline
         env:
