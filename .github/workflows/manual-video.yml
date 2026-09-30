@@ -1,0 +1,179 @@
+name: Manual Video Generator
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+
+      # ======================================================
+      # CHECKOUT
+      # ======================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      # ======================================================
+      # PYTHON
+      # ======================================================
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+
+      # ======================================================
+      # FFMPEG
+      # ======================================================
+
+      - name: Install FFmpeg
+        run: |
+          set -e
+
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+          ffmpeg -version
+
+
+      # ======================================================
+      # OLLAMA
+      # ======================================================
+
+      - name: Install Ollama
+        run: |
+          set -e
+
+          curl -fsSL https://ollama.com/install.sh | sh
+
+          ollama --version
+
+
+      - name: Start Ollama
+        run: |
+          set -e
+
+          ollama serve > /tmp/ollama.log 2>&1 &
+
+          echo "Waiting for Ollama..."
+
+          for i in {1..30}; do
+
+            if curl -fsS \
+              http://127.0.0.1:11434/api/tags \
+              > /dev/null; then
+
+              echo "✅ Ollama is ready."
+              exit 0
+
+            fi
+
+            echo "Waiting... $i/30"
+            sleep 2
+
+          done
+
+          echo "❌ Ollama failed to start."
+
+          echo "========== OLLAMA LOG =========="
+          cat /tmp/ollama.log || true
+          echo "================================"
+
+          exit 1
+
+
+      # ======================================================
+      # QWEN
+      # ======================================================
+
+      - name: Pull Qwen model
+        run: |
+          set -e
+
+          ollama pull qwen2.5:3b
+
+
+      # ======================================================
+      # PYTHON PACKAGES
+      # ======================================================
+
+      - name: Install Python dependencies
+        run: |
+          set -e
+
+          python -m pip install --upgrade pip
+
+          pip install \
+            "tenacity>=8.2.2" \
+            pycryptodome \
+            requests \
+            edge-tts \
+            "moviepy==1.0.3" \
+            "Pillow<10.0.0"
+
+          pip install mega.py --no-deps
+
+
+      # ======================================================
+      # VALIDATE ONLY PIPELINE.PY
+      # ======================================================
+
+      - name: Validate pipeline
+        run: |
+          set -e
+
+          echo "=========================================="
+          echo "🔍 CHECKING PIPELINE"
+          echo "=========================================="
+
+          echo "Current directory:"
+          pwd
+
+          echo ""
+          echo "Checking pipeline.py..."
+
+          test -f pipeline.py
+
+          echo "Checking Python syntax..."
+
+          python -m py_compile pipeline.py
+
+          echo ""
+          echo "✅ pipeline.py found"
+          echo "✅ Python syntax is valid"
+
+          echo "=========================================="
+          echo "✅ VALIDATION PASSED"
+          echo "=========================================="
+
+
+      # ======================================================
+      # RUN VIDEO ENGINE
+      # ======================================================
+
+      - name: Run video pipeline
+        env:
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+
+        run: |
+          set -e
+
+          echo "=========================================="
+          echo "🚀 STARTING STICKMAN FINANCE ENGINE"
+          echo "=========================================="
+
+          python pipeline.py
+
+          echo "=========================================="
+          echo "✅ PIPELINE FINISHED SUCCESSFULLY"
+          echo "=========================================="
