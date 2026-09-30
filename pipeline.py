@@ -1,10 +1,12 @@
 import os
 import json
 import asyncio
+import torch
 import requests
 import edge_tts
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
+from diffusers import AutoPipelineForText2Image
 from mega import Mega
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
@@ -28,13 +30,44 @@ IMAGE_DIR = os.path.join(OUTPUT_DIR, "images")
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-
-# ============================================================
-# BASIC VALIDATION
-# ============================================================
-
 if not MEGA_EMAIL or not MEGA_PASSWORD:
-    raise RuntimeError("MEGA_EMAIL and MEGA_PASSWORD GitHub Secrets are required.")
+    raise RuntimeError("MEGA_EMAIL aur MEGA_PASSWORD secrets set karna zaroori hai.")
+
+
+# ============================================================
+# LOCAL AI IMAGE ENGINE (SD-TURBO ON VM CPU)
+# ============================================================
+
+print("🧠 Loading local SD-Turbo model onto GitHub VM CPU...")
+pipe = AutoPipelineForText2Image.from_pretrained(
+    "stabilityai/sd-turbo",
+    torch_dtype=torch.float32
+)
+pipe.to("cpu")
+pipe.enable_attention_slicing()
+
+
+def generate_local_ai_image(prompt_text, output_path):
+    """Bina kisi external API ke local VM CPU par AI drawing banata hai."""
+    full_prompt = (
+        f"stickman finance cartoon, {prompt_text}, minimalist black ink stick figure on clean white paper, "
+        f"bold outlines, 2d vector style, simple, sharp, high quality"
+    )
+
+    image = pipe(
+        prompt=full_prompt,
+        num_inference_steps=1,
+        guidance_scale=0.0,
+        height=512,
+        width=512
+    ).images[0]
+
+    # 16:9 canvas (1280x720) mein fit karna
+    canvas = Image.new("RGB", (1280, 720), (255, 255, 255))
+    image = image.resize((720, 720))
+    canvas.paste(image, ((1280 - 720) // 2, 0))
+    canvas.save(output_path, format="PNG")
+    print(f"   ✅ Local AI Image created: {output_path}")
 
 
 # ============================================================
@@ -42,154 +75,23 @@ if not MEGA_EMAIL or not MEGA_PASSWORD:
 # ============================================================
 
 def clean_json_text(raw_text):
-    """Extract JSON object even if model adds markdown or explanation."""
     start = raw_text.find("{")
     end = raw_text.rfind("}")
-
     if start == -1 or end == -1 or end <= start:
-        raise ValueError("Qwen did not return a valid JSON object.")
-
+        raise ValueError("Qwen ne valid JSON object return nahi kiya.")
     return raw_text[start:end + 1]
 
 
-def request_json(url, payload, retries=3):
-    """POST JSON with retries for Ollama."""
-    last_error = None
-
-    for attempt in range(1, retries + 1):
-        try:
-            response = requests.post(url, json=payload, timeout=600)
-            response.raise_for_status()
-            return response.json()
-        except Exception as exc:
-            last_error = exc
-            print(f"⚠️ Ollama request failed (attempt {attempt}/{retries}): {exc}")
-
-    raise RuntimeError(f"Ollama request failed after {retries} attempts: {last_error}")
+def request_json(url, payload):
+    response = requests.post(url, json=payload, timeout=None)
+    response.raise_for_status()
+    return response.json()
 
 
-def get_font(size):
-    """Loads a readable TrueType font available on Ubuntu runner."""
-    font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    ]
-    for path in font_paths:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                pass
-    return ImageFont.load_default()
-
-
-def generate_procedural_scene(title_text, output_path, is_thumbnail=False):
-    """
-    Renders 1280x720 Stickman Finance illustration locally using Pillow.
-    No network requests, zero timeouts, takes ~0.05s.
-    """
-    width, height = 1280, 720
-    bg_color = (245, 247, 250) if is_thumbnail else (255, 255, 255)
-    img = Image.new("RGB", (width, height), bg_color)
-    draw = ImageDraw.Draw(img)
-
-    black = (30, 30, 30)
-    green = (34, 139, 34)
-    blue = (0, 102, 204)
-    line_w = 7
-
-    # Ground line
-    ground_y = 560
-    draw.line([(60, ground_y), (width - 60, ground_y)], fill=black, width=line_w)
-
-    # Stickman
-    cx, head_y = 380, 270
-    head_r = 45
-
-    # Head & Face
-    draw.ellipse([cx - head_r, head_y - head_r, cx + head_r, head_y + head_r], outline=black, width=line_w)
-    draw.ellipse([cx - 16, head_y - 10, cx - 8, head_y - 2], fill=black)
-    draw.ellipse([cx + 8, head_y - 10, cx + 16, head_y - 2], fill=black)
-    draw.arc([cx - 18, head_y, cx + 18, head_y + 22], start=0, end=180, fill=black, width=4)
-
-    # Body
-    spine_bottom = 440
-    draw.line([(cx, head_y + head_r), (cx, spine_bottom)], fill=black, width=line_w)
-
-    # Arms
-    draw.line([(cx, head_y + 70), (cx - 70, head_y + 120)], fill=black, width=line_w)
-    draw.line([(cx, head_y + 70), (cx + 80, head_y + 40)], fill=black, width=line_w)
-
-    # Legs
-    draw.line([(cx, spine_bottom), (cx - 50, ground_y)], fill=black, width=line_w)
-    draw.line([(cx, spine_bottom), (cx + 50, ground_y)], fill=black, width=line_w)
-
-    # Presentation / Finance Board
-    board_box = [(580, 180), (1180, 500)]
-    draw.rectangle(board_box, fill=(245, 248, 252), outline=black, width=5)
-
-    # Board Stand
-    draw.line([(880, 500), (880, ground_y)], fill=black, width=line_w)
-    draw.line([(830, ground_y), (930, ground_y)], fill=black, width=line_w)
-
-    # Chart Line (Upward trend)
-    chart_pts = [(620, 440), (750, 360), (870, 400), (1050, 240)]
-    for i in range(len(chart_pts) - 1):
-        draw.line([chart_pts[i], chart_pts[i + 1]], fill=green, width=8)
-
-    # Arrow Head
-    draw.polygon([(1050, 240), (1020, 240), (1050, 270)], fill=green)
-
-    # Money Bag
-    bx, by = 1080, 430
-    draw.ellipse([bx - 40, by - 30, bx + 40, by + 50], fill=(225, 245, 225), outline=green, width=4)
-    draw.polygon([(bx - 15, by - 30), (bx + 15, by - 30), (bx, by - 48)], fill=green)
-    draw.line([(bx, by - 15), (bx, by + 25)], fill=green, width=4)
-
-    # Header Card for narration / prompt summary
-    header_box = [(60, 40), (width - 60, 120)]
-    draw.rectangle(header_box, fill=(255, 255, 255), outline=blue if is_thumbnail else black, width=4)
-
-    title_clean = title_text.strip().replace("\n", " ")
-    if len(title_clean) > 65:
-        title_clean = title_clean[:62] + "..."
-
-    font = get_font(26 if not is_thumbnail else 30)
-    draw.text((90, 62), title_clean, fill=(0, 51, 102) if is_thumbnail else black, font=font)
-
-    img.save(output_path, format="PNG")
-    print(f"   ✅ Local PNG created: {output_path}")
-
-
-async def generate_audio(text, output_path, retries=5):
-    """Generate Edge TTS audio with retries."""
-    last_error = None
-
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"   🔊 Audio attempt {attempt}/{retries}")
-            communicate = edge_tts.Communicate(text, VOICE)
-            await communicate.save(output_path)
-
-            if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
-                raise RuntimeError("Audio file invalid or missing.")
-
-            print(f"   ✅ Audio created: {output_path}")
-            return
-
-        except Exception as exc:
-            last_error = exc
-            print(f"   ⚠️ Audio generation failed: {exc}")
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except Exception:
-                    pass
-
-            if attempt < retries:
-                await asyncio.sleep(attempt * 3)
-
-    raise RuntimeError(f"Could not generate audio after {retries} attempts: {last_error}")
+async def generate_audio(text, output_path):
+    communicate = edge_tts.Communicate(text, VOICE)
+    await communicate.save(output_path)
+    print(f"   ✅ Audio created: {output_path}")
 
 
 # ============================================================
@@ -209,22 +111,22 @@ financial mistakes, wealth building, or behavioral finance.
 
 STYLE:
 - Easy English
-- Short, clear sentences
-- 5 to 8 script sections
+- Short sentences
+- 5 to 7 script sections
 
 Return ONLY valid JSON.
-No markdown or intro text.
+No markdown.
 
 Required structure:
 {
   "video_title": "YouTube title under 70 characters",
   "seo_tags": "tag1, tag2, tag3, tag4",
-  "description": "Engaging description with key lessons and hashtags.",
-  "thumbnail_prompt": "Title text to show on the thumbnail",
+  "description": "YouTube description with hashtags.",
+  "thumbnail_prompt": "Detailed description of stickman finance thumbnail",
   "script_sections": [
     {
       "text": "Narration for this scene.",
-      "image_prompt": "Short title or scene summary (max 8 words)"
+      "image_prompt": "Detailed stickman action scene description"
     }
   ]
 }
@@ -237,41 +139,28 @@ payload = {
     "format": "json"
 }
 
-print("⏳ Qwen is generating the script...")
-
-qwen_response = request_json(OLLAMA_URL, payload, retries=3)
-
-if "response" not in qwen_response:
-    raise RuntimeError("Ollama response did not contain 'response'.")
-
+qwen_response = request_json(OLLAMA_URL, payload)
 clean_json = clean_json_text(qwen_response["response"])
 data = json.loads(clean_json)
 
 sections = data["script_sections"]
 SCENE_COUNT = len(sections)
 
-print()
-print("=" * 60)
 print(f"🎬 TITLE: {data['video_title']}")
-print(f"🎞️ SCENE COUNT: {SCENE_COUNT}")
-print("=" * 60)
+print(f"🎞️️ SCENE COUNT: {SCENE_COUNT}")
 
 
 # ============================================================
 # GENERATE THUMBNAIL
 # ============================================================
 
-print("🖼️ Generating thumbnail...")
+print("🖼️ Generating AI Thumbnail...")
 thumbnail_path = os.path.join(OUTPUT_DIR, "thumbnail.png")
-generate_procedural_scene(
-    data.get("video_title", "Stickman Finance"),
-    thumbnail_path,
-    is_thumbnail=True
-)
+generate_local_ai_image(data["thumbnail_prompt"], thumbnail_path)
 
 
 # ============================================================
-# GENERATE AUDIO + LOCAL IMAGES
+# ASSETS GENERATION
 # ============================================================
 
 async def generate_all_assets():
@@ -281,18 +170,8 @@ async def generate_all_assets():
         image_path = os.path.join(IMAGE_DIR, f"scene_{scene_number}.png")
 
         print(f"\n🎬 SCENE {index + 1}/{SCENE_COUNT}")
-        print("-" * 50)
-
         await generate_audio(section["text"], audio_path)
-        generate_procedural_scene(
-            section.get("image_prompt", f"Point {index + 1}"),
-            image_path
-        )
-
-
-print("=" * 60)
-print("🎨 GENERATING AUDIO + IMAGES")
-print("=" * 60)
+        generate_local_ai_image(section["image_prompt"], image_path)
 
 asyncio.run(generate_all_assets())
 
@@ -301,7 +180,6 @@ asyncio.run(generate_all_assets())
 # SEO FILE
 # ============================================================
 
-print("\n📝 Creating SEO file...")
 seo_path = os.path.join(OUTPUT_DIR, "seo_and_description.txt")
 with open(seo_path, "w", encoding="utf-8") as file:
     file.write(f"TITLE:\n{data['video_title']}\n\n")
@@ -311,7 +189,7 @@ with open(seo_path, "w", encoding="utf-8") as file:
 
 
 # ============================================================
-# BUILD VIDEO
+# ASSEMBLE VIDEO
 # ============================================================
 
 print("\n" + "=" * 60)
@@ -363,10 +241,6 @@ finally:
 # ============================================================
 # UPLOAD TO MEGA
 # ============================================================
-
-print("\n" + "=" * 60)
-print("☁️ UPLOADING TO MEGA")
-print("=" * 60)
 
 mega = Mega()
 m = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
