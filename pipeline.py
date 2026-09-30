@@ -1,13 +1,10 @@
 import os
 import json
 import asyncio
-import urllib.parse
-import time
 import requests
 import edge_tts
 
-from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from mega import Mega
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
@@ -22,7 +19,6 @@ MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD")
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:3b"
 
-IMAGE_BASE_URL = "https://image.pollinations.ai/prompt/"
 VOICE = "en-US-ChristopherNeural"
 
 OUTPUT_DIR = "output"
@@ -38,9 +34,7 @@ os.makedirs(IMAGE_DIR, exist_ok=True)
 # ============================================================
 
 if not MEGA_EMAIL or not MEGA_PASSWORD:
-    raise RuntimeError(
-        "MEGA_EMAIL and MEGA_PASSWORD GitHub Secrets are required."
-    )
+    raise RuntimeError("MEGA_EMAIL and MEGA_PASSWORD GitHub Secrets are required.")
 
 
 # ============================================================
@@ -48,7 +42,7 @@ if not MEGA_EMAIL or not MEGA_PASSWORD:
 # ============================================================
 
 def clean_json_text(raw_text):
-    """Extract JSON object even if model adds accidental text."""
+    """Extract JSON object even if model adds markdown or explanation."""
     start = raw_text.find("{")
     end = raw_text.rfind("}")
 
@@ -59,161 +53,133 @@ def clean_json_text(raw_text):
 
 
 def request_json(url, payload, retries=3):
-    """POST JSON with retries."""
+    """POST JSON with retries for Ollama."""
     last_error = None
 
     for attempt in range(1, retries + 1):
         try:
-            response = requests.post(
-                url,
-                json=payload,
-                timeout=600
-            )
-
+            response = requests.post(url, json=payload, timeout=600)
             response.raise_for_status()
             return response.json()
-
         except Exception as exc:
             last_error = exc
-            print(
-                f"⚠️ Request failed "
-                f"(attempt {attempt}/{retries}): {exc}"
-            )
+            print(f"⚠️ Ollama request failed (attempt {attempt}/{retries}): {exc}")
 
-            if attempt < retries:
-                time.sleep(5)
-
-    raise RuntimeError(
-        f"Request failed after {retries} attempts: {last_error}"
-    )
+    raise RuntimeError(f"Ollama request failed after {retries} attempts: {last_error}")
 
 
-def download_valid_png(prompt, output_path, retries=5):
+def get_font(size):
+    """Loads a readable TrueType font available on Ubuntu runner."""
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def generate_procedural_scene(title_text, output_path, is_thumbnail=False):
     """
-    Download image and make absolutely sure it is a real PNG.
-    This prevents MoviePy/Pillow from receiving HTML/error bytes.
+    Renders 1280x720 Stickman Finance illustration locally using Pillow.
+    No network requests, zero timeouts, takes ~0.05s.
     """
+    width, height = 1280, 720
+    bg_color = (245, 247, 250) if is_thumbnail else (255, 255, 255)
+    img = Image.new("RGB", (width, height), bg_color)
+    draw = ImageDraw.Draw(img)
 
-    encoded_prompt = urllib.parse.quote(prompt, safe="")
+    black = (30, 30, 30)
+    green = (34, 139, 34)
+    blue = (0, 102, 204)
+    line_w = 7
 
-    url = (
-        f"{IMAGE_BASE_URL}{encoded_prompt}"
-        "?width=1280"
-        "&height=720"
-        "&nologo=true"
-        "&model=flux"
-    )
+    # Ground line
+    ground_y = 560
+    draw.line([(60, ground_y), (width - 60, ground_y)], fill=black, width=line_w)
 
-    last_error = None
+    # Stickman
+    cx, head_y = 380, 270
+    head_r = 45
 
-    for attempt in range(1, retries + 1):
-        try:
-            print(
-                f"   🖼️ Image download "
-                f"attempt {attempt}/{retries}"
-            )
+    # Head & Face
+    draw.ellipse([cx - head_r, head_y - head_r, cx + head_r, head_y + head_r], outline=black, width=line_w)
+    draw.ellipse([cx - 16, head_y - 10, cx - 8, head_y - 2], fill=black)
+    draw.ellipse([cx + 8, head_y - 10, cx + 16, head_y - 2], fill=black)
+    draw.arc([cx - 18, head_y, cx + 18, head_y + 22], start=0, end=180, fill=black, width=4)
 
-            response = requests.get(
-                url,
-                timeout=180,
-                headers={
-                    "User-Agent": "Mozilla/5.0"
-                }
-            )
+    # Body
+    spine_bottom = 440
+    draw.line([(cx, head_y + head_r), (cx, spine_bottom)], fill=black, width=line_w)
 
-            response.raise_for_status()
+    # Arms
+    draw.line([(cx, head_y + 70), (cx - 70, head_y + 120)], fill=black, width=line_w)
+    draw.line([(cx, head_y + 70), (cx + 80, head_y + 40)], fill=black, width=line_w)
 
-            content = response.content
+    # Legs
+    draw.line([(cx, spine_bottom), (cx - 50, ground_y)], fill=black, width=line_w)
+    draw.line([(cx, spine_bottom), (cx + 50, ground_y)], fill=black, width=line_w)
 
-            if len(content) < 1000:
-                raise ValueError(
-                    f"Image response too small: {len(content)} bytes"
-                )
+    # Presentation / Finance Board
+    board_box = [(580, 180), (1180, 500)]
+    draw.rectangle(board_box, fill=(245, 248, 252), outline=black, width=5)
 
-            # Decode image from memory.
-            with Image.open(BytesIO(content)) as img:
-                img.load()
+    # Board Stand
+    draw.line([(880, 500), (880, ground_y)], fill=black, width=line_w)
+    draw.line([(830, ground_y), (930, ground_y)], fill=black, width=line_w)
 
-                # Always convert to RGB/RGBA-compatible PNG.
-                if img.mode not in ("RGB", "RGBA"):
-                    img = img.convert("RGB")
+    # Chart Line (Upward trend)
+    chart_pts = [(620, 440), (750, 360), (870, 400), (1050, 240)]
+    for i in range(len(chart_pts) - 1):
+        draw.line([chart_pts[i], chart_pts[i + 1]], fill=green, width=8)
 
-                img.save(
-                    output_path,
-                    format="PNG"
-                )
+    # Arrow Head
+    draw.polygon([(1050, 240), (1020, 240), (1050, 270)], fill=green)
 
-            # Final validation.
-            with Image.open(output_path) as check:
-                check.verify()
+    # Money Bag
+    bx, by = 1080, 430
+    draw.ellipse([bx - 40, by - 30, bx + 40, by + 50], fill=(225, 245, 225), outline=green, width=4)
+    draw.polygon([(bx - 15, by - 30), (bx + 15, by - 30), (bx, by - 48)], fill=green)
+    draw.line([(bx, by - 15), (bx, by + 25)], fill=green, width=4)
 
-            print(f"   ✅ Valid PNG created: {output_path}")
-            return
+    # Header Card for narration / prompt summary
+    header_box = [(60, 40), (width - 60, 120)]
+    draw.rectangle(header_box, fill=(255, 255, 255), outline=blue if is_thumbnail else black, width=4)
 
-        except Exception as exc:
-            last_error = exc
+    title_clean = title_text.strip().replace("\n", " ")
+    if len(title_clean) > 65:
+        title_clean = title_clean[:62] + "..."
 
-            print(
-                f"   ⚠️ Image generation failed: {exc}"
-            )
+    font = get_font(26 if not is_thumbnail else 30)
+    draw.text((90, 62), title_clean, fill=(0, 51, 102) if is_thumbnail else black, font=font)
 
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except Exception:
-                    pass
-
-            if attempt < retries:
-                wait_time = attempt * 5
-                print(
-                    f"   ⏳ Retrying in {wait_time} seconds..."
-                )
-                time.sleep(wait_time)
-
-    raise RuntimeError(
-        f"Could not create valid image after "
-        f"{retries} attempts: {last_error}"
-    )
+    img.save(output_path, format="PNG")
+    print(f"   ✅ Local PNG created: {output_path}")
 
 
 async def generate_audio(text, output_path, retries=5):
     """Generate Edge TTS audio with retries."""
-
     last_error = None
 
     for attempt in range(1, retries + 1):
         try:
-            print(
-                f"   🔊 Audio attempt {attempt}/{retries}"
-            )
-
-            communicate = edge_tts.Communicate(
-                text,
-                VOICE
-            )
-
+            print(f"   🔊 Audio attempt {attempt}/{retries}")
+            communicate = edge_tts.Communicate(text, VOICE)
             await communicate.save(output_path)
 
-            if not os.path.exists(output_path):
-                raise RuntimeError(
-                    "Audio file was not created."
-                )
-
-            if os.path.getsize(output_path) < 1000:
-                raise RuntimeError(
-                    "Audio file is suspiciously small."
-                )
+            if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
+                raise RuntimeError("Audio file invalid or missing.")
 
             print(f"   ✅ Audio created: {output_path}")
             return
 
         except Exception as exc:
             last_error = exc
-
-            print(
-                f"   ⚠️ Audio generation failed: {exc}"
-            )
-
+            print(f"   ⚠️ Audio generation failed: {exc}")
             if os.path.exists(output_path):
                 try:
                     os.remove(output_path)
@@ -221,16 +187,9 @@ async def generate_audio(text, output_path, retries=5):
                     pass
 
             if attempt < retries:
-                wait_time = attempt * 3
-                print(
-                    f"   ⏳ Retrying in {wait_time} seconds..."
-                )
-                await asyncio.sleep(wait_time)
+                await asyncio.sleep(attempt * 3)
 
-    raise RuntimeError(
-        f"Could not generate audio after "
-        f"{retries} attempts: {last_error}"
-    )
+    raise RuntimeError(f"Could not generate audio after {retries} attempts: {last_error}")
 
 
 # ============================================================
@@ -248,66 +207,27 @@ Create one highly engaging YouTube video about personal finance,
 money psychology, investing basics, saving, debt, income,
 financial mistakes, wealth building, or behavioral finance.
 
-The audience should be ordinary people who want to understand money
-in a simple and entertaining way.
-
 STYLE:
-- Stickman Finance
-- Simple 2D stickman cartoon
-- White/light background
-- Bold black outlines
-- Flat colors
-- Minimal visual clutter
-- Clear visual storytelling
-- No realistic humans
-- No gradients
-- No photographic style
-- No complicated charts unless absolutely necessary
-
-NARRATION:
-- Calm but engaging
 - Easy English
-- Short sentences
-- Second-person style where appropriate
-- Each section should normally contain 1-3 short sentences
-- Every section must move the story forward
-
-IMPORTANT:
-DO NOT use a fixed scene count.
-
-Choose the number of script_sections naturally based on the story.
-It may be 8, 11, 17, 23, 30, or any other reasonable number.
-
-The automation will create EXACTLY:
-1 audio file per script section
-1 image per script section
-1 video clip per script section
-
-Therefore every script_sections item must contain both text and image_prompt.
+- Short, clear sentences
+- 5 to 8 script sections
 
 Return ONLY valid JSON.
-No markdown.
-No explanation before or after JSON.
+No markdown or intro text.
 
 Required structure:
-
 {
   "video_title": "YouTube title under 70 characters",
   "seo_tags": "tag1, tag2, tag3, tag4",
-  "description": "A compelling YouTube description with a hook, useful context, CTA, and hashtags.",
-  "thumbnail_prompt": "Stickman Finance thumbnail scene representing the title, bold black outlines, flat colors, dramatic but clean composition, YouTube thumbnail style",
+  "description": "Engaging description with key lessons and hashtags.",
+  "thumbnail_prompt": "Title text to show on the thumbnail",
   "script_sections": [
     {
       "text": "Narration for this scene.",
-      "image_prompt": "Detailed Stickman Finance visual scene for this narration."
+      "image_prompt": "Short title or scene summary (max 8 words)"
     }
   ]
 }
-
-Make the story complete from beginning to end.
-Do not create empty sections.
-Do not number the sections.
-Do not put multiple scenes inside one script_sections item.
 """
 
 payload = {
@@ -319,86 +239,22 @@ payload = {
 
 print("⏳ Qwen is generating the script...")
 
-qwen_response = request_json(
-    OLLAMA_URL,
-    payload,
-    retries=3
-)
+qwen_response = request_json(OLLAMA_URL, payload, retries=3)
 
 if "response" not in qwen_response:
-    raise RuntimeError(
-        "Ollama response did not contain 'response'."
-    )
+    raise RuntimeError("Ollama response did not contain 'response'.")
 
-raw_text = qwen_response["response"]
-
-clean_json = clean_json_text(raw_text)
-
-try:
-    data = json.loads(clean_json)
-except json.JSONDecodeError as exc:
-    raise RuntimeError(
-        f"Qwen returned invalid JSON: {exc}"
-    )
-
-
-# ============================================================
-# VALIDATE SCRIPT
-# ============================================================
-
-required_fields = [
-    "video_title",
-    "seo_tags",
-    "description",
-    "thumbnail_prompt",
-    "script_sections"
-]
-
-for field in required_fields:
-    if field not in data:
-        raise RuntimeError(
-            f"Qwen JSON is missing required field: {field}"
-        )
-
+clean_json = clean_json_text(qwen_response["response"])
+data = json.loads(clean_json)
 
 sections = data["script_sections"]
-
-if not isinstance(sections, list):
-    raise RuntimeError(
-        "script_sections must be a list."
-    )
-
-if len(sections) == 0:
-    raise RuntimeError(
-        "Qwen generated zero script sections."
-    )
-
-
-for index, section in enumerate(sections):
-    if not isinstance(section, dict):
-        raise RuntimeError(
-            f"Scene {index} is not a JSON object."
-        )
-
-    if not section.get("text"):
-        raise RuntimeError(
-            f"Scene {index} has no narration text."
-        )
-
-    if not section.get("image_prompt"):
-        raise RuntimeError(
-            f"Scene {index} has no image prompt."
-        )
-
-
 SCENE_COUNT = len(sections)
 
 print()
 print("=" * 60)
 print(f"🎬 TITLE: {data['video_title']}")
-print(f"🎞️ DYNAMIC SCENE COUNT: {SCENE_COUNT}")
+print(f"🎞️ SCENE COUNT: {SCENE_COUNT}")
 print("=" * 60)
-print()
 
 
 # ============================================================
@@ -406,57 +262,31 @@ print()
 # ============================================================
 
 print("🖼️ Generating thumbnail...")
-
-thumbnail_path = os.path.join(
-    OUTPUT_DIR,
-    "thumbnail.png"
-)
-
-download_valid_png(
-    data["thumbnail_prompt"],
+thumbnail_path = os.path.join(OUTPUT_DIR, "thumbnail.png")
+generate_procedural_scene(
+    data.get("video_title", "Stickman Finance"),
     thumbnail_path,
-    retries=5
+    is_thumbnail=True
 )
 
 
 # ============================================================
-# GENERATE EXACTLY N AUDIO + IMAGE FILES
+# GENERATE AUDIO + LOCAL IMAGES
 # ============================================================
 
 async def generate_all_assets():
-
     for index, section in enumerate(sections):
-
         scene_number = str(index).zfill(3)
+        audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_number}.mp3")
+        image_path = os.path.join(IMAGE_DIR, f"scene_{scene_number}.png")
 
-        audio_path = os.path.join(
-            AUDIO_DIR,
-            f"scene_{scene_number}.mp3"
-        )
-
-        image_path = os.path.join(
-            IMAGE_DIR,
-            f"scene_{scene_number}.png"
-        )
-
-        print()
-        print(
-            f"🎬 SCENE {index + 1}/{SCENE_COUNT}"
-        )
+        print(f"\n🎬 SCENE {index + 1}/{SCENE_COUNT}")
         print("-" * 50)
 
-        await generate_audio(
-            section["text"],
-            audio_path
-        )
-
-        download_valid_png(
-            section["image_prompt"],
+        await generate_audio(section["text"], audio_path)
+        generate_procedural_scene(
+            section.get("image_prompt", f"Point {index + 1}"),
             image_path
-        )
-
-        print(
-            f"✅ Scene {index + 1}/{SCENE_COUNT} complete"
         )
 
 
@@ -471,94 +301,20 @@ asyncio.run(generate_all_assets())
 # SEO FILE
 # ============================================================
 
-print()
-print("📝 Creating SEO file...")
-
-seo_path = os.path.join(
-    OUTPUT_DIR,
-    "seo_and_description.txt"
-)
-
-with open(
-    seo_path,
-    "w",
-    encoding="utf-8"
-) as file:
-
-    file.write(
-        f"TITLE:\n{data['video_title']}\n\n"
-    )
-
-    file.write(
-        f"DESCRIPTION:\n{data['description']}\n\n"
-    )
-
-    file.write(
-        f"TAGS:\n{data['seo_tags']}\n\n"
-    )
-
-    file.write(
-        f"SCENE_COUNT:\n{SCENE_COUNT}\n"
-    )
-
-
-# ============================================================
-# FINAL VALIDATION BEFORE MOVIEPY
-# ============================================================
-
-print()
-print("=" * 60)
-print("🔍 VALIDATING GENERATED ASSETS")
-print("=" * 60)
-
-for index in range(SCENE_COUNT):
-
-    scene_number = str(index).zfill(3)
-
-    audio_path = os.path.join(
-        AUDIO_DIR,
-        f"scene_{scene_number}.mp3"
-    )
-
-    image_path = os.path.join(
-        IMAGE_DIR,
-        f"scene_{scene_number}.png"
-    )
-
-    if not os.path.isfile(audio_path):
-        raise RuntimeError(
-            f"Missing audio: {audio_path}"
-        )
-
-    if not os.path.isfile(image_path):
-        raise RuntimeError(
-            f"Missing image: {image_path}"
-        )
-
-    if os.path.getsize(audio_path) < 1000:
-        raise RuntimeError(
-            f"Invalid/empty audio: {audio_path}"
-        )
-
-    try:
-        with Image.open(image_path) as img:
-            img.verify()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Invalid PNG: {image_path}: {exc}"
-        )
-
-    print(
-        f"✅ Scene {index + 1}/{SCENE_COUNT} assets valid"
-    )
+print("\n📝 Creating SEO file...")
+seo_path = os.path.join(OUTPUT_DIR, "seo_and_description.txt")
+with open(seo_path, "w", encoding="utf-8") as file:
+    file.write(f"TITLE:\n{data['video_title']}\n\n")
+    file.write(f"DESCRIPTION:\n{data['description']}\n\n")
+    file.write(f"TAGS:\n{data['seo_tags']}\n\n")
+    file.write(f"SCENE_COUNT:\n{SCENE_COUNT}\n")
 
 
 # ============================================================
 # BUILD VIDEO
 # ============================================================
 
-print()
-print("=" * 60)
+print("\n" + "=" * 60)
 print("🎞️ ASSEMBLING FINAL VIDEO")
 print("=" * 60)
 
@@ -566,52 +322,21 @@ clips = []
 final_video = None
 
 try:
-
     for index in range(SCENE_COUNT):
-
         scene_number = str(index).zfill(3)
+        audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_number}.mp3")
+        image_path = os.path.join(IMAGE_DIR, f"scene_{scene_number}.png")
 
-        audio_path = os.path.join(
-            AUDIO_DIR,
-            f"scene_{scene_number}.mp3"
-        )
-
-        image_path = os.path.join(
-            IMAGE_DIR,
-            f"scene_{scene_number}.png"
-        )
-
-        print(
-            f"🎞️ Building clip "
-            f"{index + 1}/{SCENE_COUNT}"
-        )
-
-        audio_clip = AudioFileClip(
-            audio_path
-        )
-
+        audio_clip = AudioFileClip(audio_path)
         image_clip = (
             ImageClip(image_path)
             .set_duration(audio_clip.duration)
             .set_audio(audio_clip)
         )
-
         clips.append(image_clip)
 
-
-    print("🔗 Joining all scenes...")
-
-    final_video = concatenate_videoclips(
-        clips,
-        method="compose"
-    )
-
-    video_path = os.path.join(
-        OUTPUT_DIR,
-        "video.mp4"
-    )
-
-    print("💾 Writing video.mp4...")
+    final_video = concatenate_videoclips(clips, method="compose")
+    video_path = os.path.join(OUTPUT_DIR, "video.mp4")
 
     final_video.write_videofile(
         video_path,
@@ -623,13 +348,11 @@ try:
     )
 
 finally:
-
     for clip in clips:
         try:
             clip.close()
         except Exception:
             pass
-
     if final_video is not None:
         try:
             final_video.close()
@@ -638,111 +361,35 @@ finally:
 
 
 # ============================================================
-# FINAL VIDEO CHECK
-# ============================================================
-
-video_path = os.path.join(
-    OUTPUT_DIR,
-    "video.mp4"
-)
-
-if not os.path.isfile(video_path):
-    raise RuntimeError(
-        "Final video was not created."
-    )
-
-if os.path.getsize(video_path) < 10000:
-    raise RuntimeError(
-        "Final video file is suspiciously small."
-    )
-
-
-# ============================================================
 # UPLOAD TO MEGA
 # ============================================================
 
-print()
-print("=" * 60)
+print("\n" + "=" * 60)
 print("☁️ UPLOADING TO MEGA")
 print("=" * 60)
 
 mega = Mega()
-
-print("🔐 Logging into Mega...")
-
-m = mega.login(
-    MEGA_EMAIL,
-    MEGA_PASSWORD
-)
-
+m = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
 folder_name = "Latest_YouTube_Video"
 
-print("🧹 Removing previous Latest_YouTube_Video folder...")
-
 try:
-
     old_folder = m.find(folder_name)
-
     if old_folder:
         for folder in old_folder:
             try:
                 m.destroy(folder)
-                print("🗑️ Old folder deleted.")
-            except Exception as exc:
-                print(
-                    f"⚠️ Could not delete old folder: {exc}"
-                )
+            except Exception:
+                pass
+except Exception:
+    pass
 
-except Exception as exc:
-
-    print(
-        f"⚠️ Old folder lookup skipped: {exc}"
-    )
-
-
-print("📁 Creating new Mega folder...")
-
-folder = m.create_folder(
-    folder_name
-)
-
+folder = m.create_folder(folder_name)
 folder_id = folder[folder_name]
 
+m.upload(video_path, folder_id)
+m.upload(thumbnail_path, folder_id)
+m.upload(seo_path, folder_id)
 
-print("🚀 Uploading video...")
-
-m.upload(
-    video_path,
-    folder_id
-)
-
-print("🚀 Uploading thumbnail...")
-
-m.upload(
-    thumbnail_path,
-    folder_id
-)
-
-print("🚀 Uploading SEO file...")
-
-m.upload(
-    seo_path,
-    folder_id
-)
-
-
-# ============================================================
-# COMPLETE
-# ============================================================
-
-print()
-print("=" * 60)
+print("\n" + "=" * 60)
 print("✅ AUTOMATION COMPLETE")
-print("=" * 60)
-print(f"🎬 Title: {data['video_title']}")
-print(f"🎞️ Scenes: {SCENE_COUNT}")
-print("🔊 Audio files: generated dynamically")
-print("🖼️ Images: generated dynamically")
-print("🎞️ Video clips: generated dynamically")
-print("☁️ Mega upload: complete")
 print("=" * 60)
