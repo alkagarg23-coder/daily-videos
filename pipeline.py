@@ -7,16 +7,12 @@ import edge_tts
 
 from PIL import Image, ImageDraw, ImageFont
 from diffusers import AutoPipelineForText2Image
-from mega import Mega
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
 
 # ============================================================
 # CONFIG & AUTO COUNTER TRACKING
 # ============================================================
-
-MEGA_EMAIL = os.environ.get("MEGA_EMAIL")
-MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD")
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:3b"
@@ -28,9 +24,6 @@ IMAGE_DIR = os.path.join(OUTPUT_DIR, "images")
 
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
-
-if not MEGA_EMAIL or not MEGA_PASSWORD:
-    raise RuntimeError("MEGA_EMAIL aur MEGA_PASSWORD GitHub Secrets set karna zaroori hai.")
 
 COUNTER_FILE = "counter.txt"
 if os.path.exists(COUNTER_FILE):
@@ -142,7 +135,7 @@ async def generate_audio(text, output_path):
 
 
 # ============================================================
-# HIGH RETENTION & VIRAL SCRIPT PROMPT
+# SCRIPT GENERATION
 # ============================================================
 
 print("=" * 60)
@@ -239,7 +232,7 @@ with open(seo_path, "w", encoding="utf-8") as file:
 
 
 # ============================================================
-# ASSEMBLE FINAL NUMBERED VIDEO
+# ASSEMBLE FINAL VIDEO
 # ============================================================
 
 print("\n" + "=" * 60)
@@ -287,31 +280,6 @@ finally:
         except Exception:
             pass
 
-
-# ============================================================
-# UPLOAD TO MEGA
-# ============================================================
-
 print("\n" + "=" * 60)
-print(f"☁️ UPLOADING EPISODE {CURRENT_COUNT} TO MEGA")
-print("=" * 60)
-
-mega = Mega()
-m = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
-folder_name = "Stickman_Finance_Series"
-
-folder_id = None
-all_folders = m.find(folder_name)
-if all_folders:
-    folder_id = all_folders[0]
-else:
-    new_folder = m.create_folder(folder_name)
-    folder_id = new_folder[folder_name]
-
-m.upload(video_path, folder_id)
-m.upload(thumbnail_path, folder_id)
-m.upload(seo_path, folder_id)
-
-print("\n" + "=" * 60)
-print(f"✅ EPISODE {CURRENT_COUNT} COMPLETE & UPLOADED SUCCESSFULLY")
+print(f"✅ EPISODE #{CURRENT_COUNT} CREATED LOCALLY IN 'output/'")
 print("=" * 60)
