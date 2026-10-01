@@ -281,5 +281,5 @@ finally:
             pass
 
 print("\n" + "=" * 60)
-print(f"✅ EPISODE #{CURRENT_COUNT} CREATED LOCALLY IN 'output/'")
+print(f"✅ EPISODE #{CURRENT_COUNT} CREATED IN 'output/'")
 print("=" * 60)
