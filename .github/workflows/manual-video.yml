@@ -2,12 +2,12 @@ name: Daily Auto Video Generator
 
 on:
   schedule:
-    # Roj raat 12:00 UTC (Subah 5:30 AM IST) apne aap chalega
+    # Roz raat 12:00 UTC (5:30 AM IST) apne aap chalega
     - cron: '0 0 * * *'
-  workflow_dispatch: # Isse tum manually bhi jab chaho chala sakte ho
+  workflow_dispatch: # Manually run karne ke liye button
 
 permissions:
-  contents: write # Counter update karke commit karne ke liye zaroori hai
+  contents: write
 
 jobs:
   generate-and-upload:
@@ -22,11 +22,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install FFmpeg
+      - name: Install FFmpeg & Fonts
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
           ffmpeg -version
 
       - name: Install Ollama
@@ -74,7 +74,6 @@ jobs:
           set -e
           python pipeline.py
 
-      # Auto-save counter back to GitHub repository
       - name: Commit and push counter update
         run: |
           git config --global user.name "github-actions[bot]"
