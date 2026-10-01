@@ -9,7 +9,6 @@ from PIL import Image, ImageDraw, ImageFont
 from diffusers import AutoPipelineForText2Image
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
-
 # ============================================================
 # CONFIG & AUTO COUNTER TRACKING
 # ============================================================
@@ -40,7 +39,6 @@ with open(COUNTER_FILE, "w") as f:
 
 print(f"🎯 Starting Long-Form Engine (20-30 Min) for Episode #{CURRENT_COUNT}")
 
-
 # ============================================================
 # LOCAL AI IMAGE ENGINE (SD-TURBO ON VM CPU)
 # ============================================================
@@ -52,7 +50,6 @@ pipe = AutoPipelineForText2Image.from_pretrained(
 )
 pipe.to("cpu")
 pipe.enable_attention_slicing()
-
 
 def get_system_font(size):
     font_paths = [
@@ -66,7 +63,6 @@ def get_system_font(size):
             except Exception:
                 pass
     return ImageFont.load_default()
-
 
 def generate_local_ai_image(prompt_text, output_path, overlay_text=None):
     full_prompt = (
@@ -109,7 +105,6 @@ def generate_local_ai_image(prompt_text, output_path, overlay_text=None):
     canvas.save(output_path, format="PNG")
     print(f"   ✅ Image ready: {output_path}")
 
-
 # ============================================================
 # HELPERS
 # ============================================================
@@ -121,18 +116,15 @@ def clean_json_text(raw_text):
         raise ValueError("Qwen did not return a valid JSON object.")
     return raw_text[start:end + 1]
 
-
 def request_json(url, payload):
     response = requests.post(url, json=payload, timeout=None)
     response.raise_for_status()
     return response.json()
 
-
 async def generate_audio(text, output_path):
     communicate = edge_tts.Communicate(text, VOICE)
     await communicate.save(output_path)
     print(f"   ✅ Audio ready: {output_path}")
-
 
 # ============================================================
 # STEP 1: GENERATE OVERALL VIDEO PLAN & OUTLINE
@@ -174,7 +166,6 @@ chapters = plan_data["chapters"]
 print(f"🎬 Title: {video_title}")
 print(f"📚 Chapters: {len(chapters)}")
 
-
 # ============================================================
 # STEP 2: GENERATE THUMBNAIL
 # ============================================================
@@ -182,7 +173,6 @@ print(f"📚 Chapters: {len(chapters)}")
 print("\n🖼️ Generating Masterclass AI Thumbnail...")
 thumbnail_path = os.path.join(OUTPUT_DIR, f"thumbnail_{CURRENT_COUNT}.png")
 generate_local_ai_image(thumbnail_prompt, thumbnail_path, overlay_text=thumbnail_badge)
-
 
 # ============================================================
 # STEP 3: DEEP-DIVE SCRIPT & ASSET GENERATION FOR EACH CHAPTER
@@ -215,10 +205,8 @@ Return ONLY valid JSON:
     chap_data = json.loads(clean_json_text(chap_res["response"]))
     all_sections.extend(chap_data["scenes"])
 
-
 TOTAL_SCENES = len(all_sections)
 print(f"\n🎬 Total scenes generated for full video: {TOTAL_SCENES}")
-
 
 # ============================================================
 # STEP 4: GENERATE ASSETS (AUDIO + AI IMAGES)
@@ -236,7 +224,6 @@ async def generate_assets():
 
 asyncio.run(generate_assets())
 
-
 # ============================================================
 # STEP 5: SAVE SEO & DESCRIPTION
 # ============================================================
@@ -248,7 +235,6 @@ with open(seo_path, "w", encoding="utf-8") as f:
     f.write(f"TAGS:\n{plan_data['seo_tags']}\n\n")
     f.write(f"EPISODE:\n#{CURRENT_COUNT}\n")
     f.write(f"TOTAL_SCENES:\n{TOTAL_SCENES}\n")
-
 
 # ============================================================
 # STEP 6: ASSEMBLE 20-30 MINUTE VIDEO (MOVIEPY)
@@ -278,14 +264,13 @@ try:
     final_video = concatenate_videoclips(clips, method="compose")
     video_path = os.path.join(OUTPUT_DIR, f"video_{CURRENT_COUNT}.mp4")
 
-    # threads=2 runner CPU ke optimal utilization ke liye
     final_video.write_videofile(
         video_path,
         fps=24,
         codec="libx264",
         audio_codec="aac",
         threads=2,
-        preset="ultrafast",  # Fast rendering for long videos
+        preset="ultrafast",
         logger="bar"
     )
 
@@ -302,5 +287,5 @@ finally:
             pass
 
 print("\n" + "=" * 60)
-print(f"✅ FULL-LENGTH 20-30 MIN MASTERCLASS #{CURRENT_COUNT} ASSEMBLED!")
+print(f"✅ FULL-LENGTH MASTERCLASS #{CURRENT_COUNT} ASSEMBLED LOCALLY!")
 print("=" * 60)
