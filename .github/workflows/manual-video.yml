@@ -2,9 +2,8 @@ name: Daily Auto Video Generator
 
 on:
   schedule:
-    # Roz raat 12:00 UTC (5:30 AM IST) apne aap chalega
     - cron: '0 0 * * *'
-  workflow_dispatch: # Manually run karne ke liye button
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -63,16 +62,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install diffusers transformers accelerate
-          pip install "tenacity>=8.2.2" pycryptodome requests edge-tts "moviepy==1.0.3" Pillow
-          pip install mega.py --no-deps
+          pip install "tenacity>=8.2.2" requests edge-tts "moviepy==1.0.3" Pillow
 
       - name: Run video pipeline
-        env:
-          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
-          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
         run: |
           set -e
           python pipeline.py
+
+      - name: Upload Run Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-bundle
+          path: output/
+
+      - name: Publish to GitHub Releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          COUNT=$(cat counter.txt)
+          gh release create "v${COUNT}" \
+            output/video_${COUNT}.mp4 \
+            output/thumbnail_${COUNT}.png \
+            output/seo_${COUNT}.txt \
+            --title "Stickman Finance Episode #${COUNT}" \
+            --notes-file output/seo_${COUNT}.txt || echo "Release creation completed."
 
       - name: Commit and push counter update
         run: |
