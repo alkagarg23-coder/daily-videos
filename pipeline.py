@@ -5,14 +5,14 @@ import torch
 import requests
 import edge_tts
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from diffusers import AutoPipelineForText2Image
 from mega import Mega
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
 
 # ============================================================
-# CONFIG
+# CONFIG & AUTO COUNTER TRACKING
 # ============================================================
 
 MEGA_EMAIL = os.environ.get("MEGA_EMAIL")
@@ -20,7 +20,6 @@ MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD")
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:3b"
-
 VOICE = "en-US-ChristopherNeural"
 
 OUTPUT_DIR = "output"
@@ -31,14 +30,29 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
 if not MEGA_EMAIL or not MEGA_PASSWORD:
-    raise RuntimeError("MEGA_EMAIL aur MEGA_PASSWORD secrets set karna zaroori hai.")
+    raise RuntimeError("MEGA_EMAIL aur MEGA_PASSWORD GitHub Secrets set karna zaroori hai.")
+
+COUNTER_FILE = "counter.txt"
+if os.path.exists(COUNTER_FILE):
+    try:
+        with open(COUNTER_FILE, "r") as f:
+            CURRENT_COUNT = int(f.read().strip()) + 1
+    except Exception:
+        CURRENT_COUNT = 1
+else:
+    CURRENT_COUNT = 1
+
+with open(COUNTER_FILE, "w") as f:
+    f.write(str(CURRENT_COUNT))
+
+print(f"🎯 Running pipeline for Episode #{CURRENT_COUNT}")
 
 
 # ============================================================
 # LOCAL AI IMAGE ENGINE (SD-TURBO ON VM CPU)
 # ============================================================
 
-print("🧠 Loading local SD-Turbo model onto GitHub VM CPU...")
+print("🧠 Loading local SD-Turbo model onto VM CPU...")
 pipe = AutoPipelineForText2Image.from_pretrained(
     "stabilityai/sd-turbo",
     torch_dtype=torch.float32
@@ -47,11 +61,25 @@ pipe.to("cpu")
 pipe.enable_attention_slicing()
 
 
-def generate_local_ai_image(prompt_text, output_path):
-    """Bina kisi external API ke local VM CPU par AI drawing banata hai."""
+def get_system_font(size):
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def generate_local_ai_image(prompt_text, output_path, overlay_text=None):
     full_prompt = (
-        f"stickman finance cartoon, {prompt_text}, minimalist black ink stick figure on clean white paper, "
-        f"bold outlines, 2d vector style, simple, sharp, high quality"
+        f"cartoon stickman finance illustration, {prompt_text}, "
+        f"clean bold black lines, high contrast, flat 2d vector style, expressive actions, "
+        f"minimalist art, youtube stickman animation style, plain white background"
     )
 
     image = pipe(
@@ -62,10 +90,29 @@ def generate_local_ai_image(prompt_text, output_path):
         width=512
     ).images[0]
 
-    # 16:9 canvas (1280x720) mein fit karna
     canvas = Image.new("RGB", (1280, 720), (255, 255, 255))
     image = image.resize((720, 720))
     canvas.paste(image, ((1280 - 720) // 2, 0))
+
+    if overlay_text:
+        draw = ImageDraw.Draw(canvas)
+        font = get_system_font(52)
+        clean_badge = overlay_text.upper().strip()
+
+        text_bbox = draw.textbbox((0, 0), clean_badge, font=font)
+        text_w = text_bbox[2] - text_bbox[0]
+        text_h = text_bbox[3] - text_bbox[1]
+
+        bx, by = 60, 50
+        padding_x, padding_y = 30, 15
+        draw.rectangle(
+            [(bx, by), (bx + text_w + padding_x * 2, by + text_h + padding_y * 2)],
+            fill=(255, 221, 0),
+            outline=(0, 0, 0),
+            width=5
+        )
+        draw.text((bx + padding_x, by + padding_y), clean_badge, fill=(0, 0, 0), font=font)
+
     canvas.save(output_path, format="PNG")
     print(f"   ✅ Local AI Image created: {output_path}")
 
@@ -95,41 +142,39 @@ async def generate_audio(text, output_path):
 
 
 # ============================================================
-# QWEN SCRIPT GENERATION
+# HIGH RETENTION & VIRAL SCRIPT PROMPT
 # ============================================================
 
 print("=" * 60)
-print("🧠 ASKING QWEN TO CREATE STICKMAN FINANCE VIDEO")
+print(f"🧠 ASKING QWEN TO CREATE STICKMAN FINANCE EPISODE #{CURRENT_COUNT}")
 print("=" * 60)
 
-prompt = """
-You are an automated YouTube video engine for a Stickman Finance channel.
+prompt = f"""
+You are an expert viral YouTube scriptwriter for a Stickman Finance channel.
+Generate Episode #{CURRENT_COUNT}.
 
-Create one highly engaging YouTube video about personal finance,
-money psychology, investing basics, saving, debt, income,
-financial mistakes, wealth building, or behavioral finance.
+GOAL: Extreme retention, fast-paced storytelling, and high CTR clickbait.
 
-STYLE:
-- Easy English
-- Short sentences
-- 5 to 7 script sections
+RULES:
+- Hook in first 3 seconds: No intros, no greetings. Start with a shocking mistake or urgent rule.
+- Short, punchy sentences (Grade 4-5 level simple English).
+- Fast rhythm: 6 to 8 scenes. Each scene must be only 1 to 2 short sentences.
+- Clickbait thumbnail text: 2-3 words ONLY in ALL CAPS (e.g. STOP THIS!, BIG LIE!, SAVE $10,000).
 
-Return ONLY valid JSON.
-No markdown.
-
-Required structure:
-{
-  "video_title": "YouTube title under 70 characters",
-  "seo_tags": "tag1, tag2, tag3, tag4",
-  "description": "YouTube description with hashtags.",
-  "thumbnail_prompt": "Detailed description of stickman finance thumbnail",
+Return ONLY valid JSON:
+{{
+  "video_title": "Curiosity driven title under 55 characters",
+  "seo_tags": "finance, money tips, investing, debt, wealth, habits",
+  "description": "Engaging YouTube description with hook, actionable lessons, and viral hashtags.",
+  "thumbnail_text": "2-3 WORDS ALL CAPS",
+  "thumbnail_prompt": "Shocked stickman pointing at burning wallet, dramatic facial expression, simple clean cartoon",
   "script_sections": [
-    {
-      "text": "Narration for this scene.",
-      "image_prompt": "Detailed stickman action scene description"
-    }
+    {{
+      "text": "1-2 punchy spoken lines.",
+      "image_prompt": "Clear stickman action, e.g. stickman drowning under a giant credit card"
+    }}
   ]
-}
+}}
 """
 
 payload = {
@@ -143,20 +188,25 @@ qwen_response = request_json(OLLAMA_URL, payload)
 clean_json = clean_json_text(qwen_response["response"])
 data = json.loads(clean_json)
 
+final_title = f"{data['video_title']} #{CURRENT_COUNT}"
 sections = data["script_sections"]
 SCENE_COUNT = len(sections)
 
-print(f"🎬 TITLE: {data['video_title']}")
-print(f"🎞️️ SCENE COUNT: {SCENE_COUNT}")
+print(f"🎬 TITLE: {final_title}")
+print(f"🎞️ SCENE COUNT: {SCENE_COUNT}")
 
 
 # ============================================================
-# GENERATE THUMBNAIL
+# GENERATE CLICKBAIT THUMBNAIL
 # ============================================================
 
-print("🖼️ Generating AI Thumbnail...")
-thumbnail_path = os.path.join(OUTPUT_DIR, "thumbnail.png")
-generate_local_ai_image(data["thumbnail_prompt"], thumbnail_path)
+print(f"\n🖼️ Generating AI Thumbnail #{CURRENT_COUNT}...")
+thumbnail_path = os.path.join(OUTPUT_DIR, f"thumbnail_{CURRENT_COUNT}.png")
+generate_local_ai_image(
+    data["thumbnail_prompt"],
+    thumbnail_path,
+    overlay_text=data.get("thumbnail_text", "DON'T DO THIS!")
+)
 
 
 # ============================================================
@@ -177,23 +227,23 @@ asyncio.run(generate_all_assets())
 
 
 # ============================================================
-# SEO FILE
+# NUMBERED SEO FILE
 # ============================================================
 
-seo_path = os.path.join(OUTPUT_DIR, "seo_and_description.txt")
+seo_path = os.path.join(OUTPUT_DIR, f"seo_{CURRENT_COUNT}.txt")
 with open(seo_path, "w", encoding="utf-8") as file:
-    file.write(f"TITLE:\n{data['video_title']}\n\n")
+    file.write(f"TITLE:\n{final_title}\n\n")
     file.write(f"DESCRIPTION:\n{data['description']}\n\n")
     file.write(f"TAGS:\n{data['seo_tags']}\n\n")
-    file.write(f"SCENE_COUNT:\n{SCENE_COUNT}\n")
+    file.write(f"EPISODE_NUMBER:\n{CURRENT_COUNT}\n")
 
 
 # ============================================================
-# ASSEMBLE VIDEO
+# ASSEMBLE FINAL NUMBERED VIDEO
 # ============================================================
 
 print("\n" + "=" * 60)
-print("🎞️ ASSEMBLING FINAL VIDEO")
+print(f"🎞️ ASSEMBLING VIDEO {CURRENT_COUNT}")
 print("=" * 60)
 
 clips = []
@@ -214,7 +264,7 @@ try:
         clips.append(image_clip)
 
     final_video = concatenate_videoclips(clips, method="compose")
-    video_path = os.path.join(OUTPUT_DIR, "video.mp4")
+    video_path = os.path.join(OUTPUT_DIR, f"video_{CURRENT_COUNT}.mp4")
 
     final_video.write_videofile(
         video_path,
@@ -242,28 +292,26 @@ finally:
 # UPLOAD TO MEGA
 # ============================================================
 
+print("\n" + "=" * 60)
+print(f"☁️ UPLOADING EPISODE {CURRENT_COUNT} TO MEGA")
+print("=" * 60)
+
 mega = Mega()
 m = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
-folder_name = "Latest_YouTube_Video"
+folder_name = "Stickman_Finance_Series"
 
-try:
-    old_folder = m.find(folder_name)
-    if old_folder:
-        for folder in old_folder:
-            try:
-                m.destroy(folder)
-            except Exception:
-                pass
-except Exception:
-    pass
-
-folder = m.create_folder(folder_name)
-folder_id = folder[folder_name]
+folder_id = None
+all_folders = m.find(folder_name)
+if all_folders:
+    folder_id = all_folders[0]
+else:
+    new_folder = m.create_folder(folder_name)
+    folder_id = new_folder[folder_name]
 
 m.upload(video_path, folder_id)
 m.upload(thumbnail_path, folder_id)
 m.upload(seo_path, folder_id)
 
 print("\n" + "=" * 60)
-print("✅ AUTOMATION COMPLETE")
+print(f"✅ EPISODE {CURRENT_COUNT} COMPLETE & UPLOADED SUCCESSFULLY")
 print("=" * 60)
