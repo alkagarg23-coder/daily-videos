@@ -38,7 +38,7 @@ else:
 with open(COUNTER_FILE, "w") as f:
     f.write(str(CURRENT_COUNT))
 
-print(f"🎯 Running pipeline for Episode #{CURRENT_COUNT}")
+print(f"🎯 Starting Long-Form Engine (20-30 Min) for Episode #{CURRENT_COUNT}")
 
 
 # ============================================================
@@ -107,7 +107,7 @@ def generate_local_ai_image(prompt_text, output_path, overlay_text=None):
         draw.text((bx + padding_x, by + padding_y), clean_badge, fill=(0, 0, 0), font=font)
 
     canvas.save(output_path, format="PNG")
-    print(f"   ✅ Local AI Image created: {output_path}")
+    print(f"   ✅ Image ready: {output_path}")
 
 
 # ============================================================
@@ -118,7 +118,7 @@ def clean_json_text(raw_text):
     start = raw_text.find("{")
     end = raw_text.rfind("}")
     if start == -1 or end == -1 or end <= start:
-        raise ValueError("Qwen ne valid JSON object return nahi kiya.")
+        raise ValueError("Qwen did not return a valid JSON object.")
     return raw_text[start:end + 1]
 
 
@@ -131,122 +131,141 @@ def request_json(url, payload):
 async def generate_audio(text, output_path):
     communicate = edge_tts.Communicate(text, VOICE)
     await communicate.save(output_path)
-    print(f"   ✅ Audio created: {output_path}")
+    print(f"   ✅ Audio ready: {output_path}")
 
 
 # ============================================================
-# SCRIPT GENERATION
+# STEP 1: GENERATE OVERALL VIDEO PLAN & OUTLINE
 # ============================================================
 
 print("=" * 60)
-print(f"🧠 ASKING QWEN TO CREATE STICKMAN FINANCE EPISODE #{CURRENT_COUNT}")
+print(f"🧠 STEP 1: PLANNING 20-30 MINUTE MASTERCLASS #{CURRENT_COUNT}")
 print("=" * 60)
 
-prompt = f"""
-You are an expert viral YouTube scriptwriter for a Stickman Finance channel.
-Generate Episode #{CURRENT_COUNT}.
-
-GOAL: Extreme retention, fast-paced storytelling, and high CTR clickbait.
-
-RULES:
-- Hook in first 3 seconds: No intros, no greetings. Start with a shocking mistake or urgent rule.
-- Short, punchy sentences (Grade 4-5 level simple English).
-- Fast rhythm: 6 to 8 scenes. Each scene must be only 1 to 2 short sentences.
-- Clickbait thumbnail text: 2-3 words ONLY in ALL CAPS (e.g. STOP THIS!, BIG LIE!, SAVE $10,000).
+outline_prompt = f"""
+You are an elite YouTube creator making a 25-minute deep-dive Masterclass on Personal Finance Episode #{CURRENT_COUNT}.
+Plan 5 comprehensive chapters that cover every aspect in depth (Saving, Investing, Psychology, Debt Traps, Building Wealth).
 
 Return ONLY valid JSON:
 {{
-  "video_title": "Curiosity driven title under 55 characters",
-  "seo_tags": "finance, money tips, investing, debt, wealth, habits",
-  "description": "Engaging YouTube description with hook, actionable lessons, and viral hashtags.",
-  "thumbnail_text": "2-3 WORDS ALL CAPS",
-  "thumbnail_prompt": "Shocked stickman pointing at burning wallet, dramatic facial expression, simple clean cartoon",
-  "script_sections": [
-    {{
-      "text": "1-2 punchy spoken lines.",
-      "image_prompt": "Clear stickman action, e.g. stickman drowning under a giant credit card"
-    }}
+  "video_title": "Ultimate Financial Masterclass: From Broke to Wealthy",
+  "seo_tags": "personal finance, investing 101, build wealth, financial freedom, money mastery",
+  "description": "A comprehensive 25-minute masterclass covering everything you need to know about money management.",
+  "thumbnail_text": "DON'T BE POOR!",
+  "thumbnail_prompt": "Shocked stickman holding an empty wallet vs wealthy stickman sitting on gold coins, dramatic cartoon",
+  "chapters": [
+    "The Dark Psychology of Consumerism & Spending Traps",
+    "The Emergency Fund Blueprint and Cashflow System",
+    "Understanding Debt: Good Debt vs Toxic Debt",
+    "Index Funds & Compound Interest: The Real Math",
+    "Building Multi-Stream Wealth & Long-Term Freedom"
   ]
 }}
 """
 
-payload = {
-    "model": OLLAMA_MODEL,
-    "prompt": prompt,
-    "stream": False,
-    "format": "json"
-}
+response = request_json(OLLAMA_URL, {"model": OLLAMA_MODEL, "prompt": outline_prompt, "stream": False, "format": "json"})
+plan_data = json.loads(clean_json_text(response["response"]))
 
-qwen_response = request_json(OLLAMA_URL, payload)
-clean_json = clean_json_text(qwen_response["response"])
-data = json.loads(clean_json)
+video_title = f"{plan_data['video_title']} #{CURRENT_COUNT}"
+thumbnail_prompt = plan_data["thumbnail_prompt"]
+thumbnail_badge = plan_data.get("thumbnail_text", "MUST WATCH!")
+chapters = plan_data["chapters"]
 
-final_title = f"{data['video_title']} #{CURRENT_COUNT}"
-sections = data["script_sections"]
-SCENE_COUNT = len(sections)
-
-print(f"🎬 TITLE: {final_title}")
-print(f"🎞️ SCENE COUNT: {SCENE_COUNT}")
+print(f"🎬 Title: {video_title}")
+print(f"📚 Chapters: {len(chapters)}")
 
 
 # ============================================================
-# GENERATE CLICKBAIT THUMBNAIL
+# STEP 2: GENERATE THUMBNAIL
 # ============================================================
 
-print(f"\n🖼️ Generating AI Thumbnail #{CURRENT_COUNT}...")
+print("\n🖼️ Generating Masterclass AI Thumbnail...")
 thumbnail_path = os.path.join(OUTPUT_DIR, f"thumbnail_{CURRENT_COUNT}.png")
-generate_local_ai_image(
-    data["thumbnail_prompt"],
-    thumbnail_path,
-    overlay_text=data.get("thumbnail_text", "DON'T DO THIS!")
-)
+generate_local_ai_image(thumbnail_prompt, thumbnail_path, overlay_text=thumbnail_badge)
 
 
 # ============================================================
-# ASSETS GENERATION
+# STEP 3: DEEP-DIVE SCRIPT & ASSET GENERATION FOR EACH CHAPTER
 # ============================================================
 
-async def generate_all_assets():
-    for index, section in enumerate(sections):
-        scene_number = str(index).zfill(3)
-        audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_number}.mp3")
-        image_path = os.path.join(IMAGE_DIR, f"scene_{scene_number}.png")
+all_sections = []
 
-        print(f"\n🎬 SCENE {index + 1}/{SCENE_COUNT}")
-        await generate_audio(section["text"], audio_path)
-        generate_local_ai_image(section["image_prompt"], image_path)
+for c_idx, chapter_title in enumerate(chapters):
+    print("\n" + "=" * 60)
+    print(f"📖 WRITING CHAPTER {c_idx + 1}/{len(chapters)}: {chapter_title}")
+    print("=" * 60)
 
-asyncio.run(generate_all_assets())
+    chapter_prompt = f"""
+Write Chapter {c_idx + 1} for a 25-minute deep-dive YouTube video: "{chapter_title}".
+Provide 7 detailed scenes for this chapter.
+Each scene MUST contain a long, detailed, and educational explanation (around 60 to 90 words per scene) to keep viewer learning.
+Simple conversational English, full of real examples and relatable analogies.
+
+Return ONLY valid JSON:
+{{
+  "scenes": [
+    {{
+      "narration": "Deep detailed spoken paragraph (60-90 words)...",
+      "image_prompt": "Stickman character demonstrating this exact concept"
+    }}
+  ]
+}}
+"""
+    chap_res = request_json(OLLAMA_URL, {"model": OLLAMA_MODEL, "prompt": chapter_prompt, "stream": False, "format": "json"})
+    chap_data = json.loads(clean_json_text(chap_res["response"]))
+    all_sections.extend(chap_data["scenes"])
+
+
+TOTAL_SCENES = len(all_sections)
+print(f"\n🎬 Total scenes generated for full video: {TOTAL_SCENES}")
 
 
 # ============================================================
-# NUMBERED SEO FILE
+# STEP 4: GENERATE ASSETS (AUDIO + AI IMAGES)
+# ============================================================
+
+async def generate_assets():
+    for idx, scene in enumerate(all_sections):
+        scene_id = str(idx).zfill(3)
+        audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_id}.mp3")
+        image_path = os.path.join(IMAGE_DIR, f"scene_{scene_id}.png")
+
+        print(f"\n⚙️ Rendering Scene {idx + 1}/{TOTAL_SCENES}...")
+        await generate_audio(scene["narration"], audio_path)
+        generate_local_ai_image(scene["image_prompt"], image_path)
+
+asyncio.run(generate_assets())
+
+
+# ============================================================
+# STEP 5: SAVE SEO & DESCRIPTION
 # ============================================================
 
 seo_path = os.path.join(OUTPUT_DIR, f"seo_{CURRENT_COUNT}.txt")
-with open(seo_path, "w", encoding="utf-8") as file:
-    file.write(f"TITLE:\n{final_title}\n\n")
-    file.write(f"DESCRIPTION:\n{data['description']}\n\n")
-    file.write(f"TAGS:\n{data['seo_tags']}\n\n")
-    file.write(f"EPISODE_NUMBER:\n{CURRENT_COUNT}\n")
+with open(seo_path, "w", encoding="utf-8") as f:
+    f.write(f"TITLE:\n{video_title}\n\n")
+    f.write(f"DESCRIPTION:\n{plan_data['description']}\n\n")
+    f.write(f"TAGS:\n{plan_data['seo_tags']}\n\n")
+    f.write(f"EPISODE:\n#{CURRENT_COUNT}\n")
+    f.write(f"TOTAL_SCENES:\n{TOTAL_SCENES}\n")
 
 
 # ============================================================
-# ASSEMBLE FINAL VIDEO
+# STEP 6: ASSEMBLE 20-30 MINUTE VIDEO (MOVIEPY)
 # ============================================================
 
 print("\n" + "=" * 60)
-print(f"🎞️ ASSEMBLING VIDEO {CURRENT_COUNT}")
+print(f"🎞️ ASSEMBLING FULL MASTERCLASS VIDEO ({TOTAL_SCENES} SCENES)")
 print("=" * 60)
 
 clips = []
 final_video = None
 
 try:
-    for index in range(SCENE_COUNT):
-        scene_number = str(index).zfill(3)
-        audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_number}.mp3")
-        image_path = os.path.join(IMAGE_DIR, f"scene_{scene_number}.png")
+    for idx in range(TOTAL_SCENES):
+        scene_id = str(idx).zfill(3)
+        audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_id}.mp3")
+        image_path = os.path.join(IMAGE_DIR, f"scene_{scene_id}.png")
 
         audio_clip = AudioFileClip(audio_path)
         image_clip = (
@@ -259,12 +278,14 @@ try:
     final_video = concatenate_videoclips(clips, method="compose")
     video_path = os.path.join(OUTPUT_DIR, f"video_{CURRENT_COUNT}.mp4")
 
+    # threads=2 runner CPU ke optimal utilization ke liye
     final_video.write_videofile(
         video_path,
         fps=24,
         codec="libx264",
         audio_codec="aac",
         threads=2,
+        preset="ultrafast",  # Fast rendering for long videos
         logger="bar"
     )
 
@@ -281,5 +302,5 @@ finally:
             pass
 
 print("\n" + "=" * 60)
-print(f"✅ EPISODE #{CURRENT_COUNT} CREATED IN 'output/'")
+print(f"✅ FULL-LENGTH 20-30 MIN MASTERCLASS #{CURRENT_COUNT} ASSEMBLED!")
 print("=" * 60)
