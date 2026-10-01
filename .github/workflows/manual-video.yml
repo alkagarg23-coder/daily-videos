@@ -1,9 +1,10 @@
-name: Daily Auto Video Generator
+name: Daily Long-Form Video Generator
 
 on:
   schedule:
+    # Roz raat 12:00 UTC (5:30 AM IST) apne aap chalega
     - cron: '0 0 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Manually chalane ke liye button
 
 permissions:
   contents: write
@@ -11,6 +12,8 @@ permissions:
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
+    # 20-30 minute video processing ke liye aaraam se 2 ghante ka time
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
@@ -38,7 +41,7 @@ jobs:
         run: |
           set -e
           ollama serve > /tmp/ollama.log 2>&1 &
-          echo "Waiting for Ollama..."
+          echo "Waiting for Ollama to be ready..."
           for i in {1..30}; do
             if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
               echo "✅ Ollama is ready."
@@ -64,16 +67,10 @@ jobs:
           pip install diffusers transformers accelerate
           pip install "tenacity>=8.2.2" requests edge-tts "moviepy==1.0.3" Pillow
 
-      - name: Run video pipeline
+      - name: Run 20-30 Min Video Pipeline
         run: |
           set -e
           python pipeline.py
-
-      - name: Upload Run Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: video-bundle
-          path: output/
 
       - name: Publish to GitHub Releases
         env:
@@ -85,7 +82,7 @@ jobs:
             output/video_${COUNT}.mp4 \
             output/thumbnail_${COUNT}.png \
             output/seo_${COUNT}.txt \
-            --title "Stickman Finance Episode #${COUNT}" \
+            --title "Stickman Finance Masterclass Episode #${COUNT}" \
             --notes-file output/seo_${COUNT}.txt || echo "Release creation completed."
 
       - name: Commit and push counter update
