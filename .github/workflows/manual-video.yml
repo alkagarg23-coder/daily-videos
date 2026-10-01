@@ -12,7 +12,7 @@ permissions:
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
-    # 20-30 minute video processing ke liye aaraam se 2 ghante ka time
+    # 20-30 minute video processing ke liye aaraam se 3 ghante ka time (180 mins)
     timeout-minutes: 180
 
     steps:
@@ -78,6 +78,7 @@ jobs:
         run: |
           set -e
           COUNT=$(cat counter.txt)
+          # Ye command video ko Mega ki jagah GitHub Releases me daal degi
           gh release create "v${COUNT}" \
             output/video_${COUNT}.mp4 \
             output/thumbnail_${COUNT}.png \
