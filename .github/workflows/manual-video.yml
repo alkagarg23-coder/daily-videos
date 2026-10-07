@@ -1,4 +1,4 @@
-name: Daily Long-Form Video Generator
+name: Perfect-Sync Timeline Video Engine
 
 on:
   schedule:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360 # 6 hours max limit allowed for 300-400 images
 
     steps:
       - name: Checkout repository
@@ -22,24 +22,24 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install FFmpeg & Fonts
+      - name: Install System Dependencies (FFmpeg & Fonts)
         run: |
           set -e
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-dejavu-core
           ffmpeg -version
 
-      - name: Install Ollama
+      - name: Install Ollama (Local LLM Engine)
         run: |
           set -e
           curl -fsSL https://ollama.com/install.sh | sh
           ollama --version
 
-      - name: Start Ollama
+      - name: Start Ollama Background Service
         run: |
           set -e
           ollama serve > /tmp/ollama.log 2>&1 &
-          echo "Waiting for Ollama to be ready..."
+          echo "Waiting for Ollama to boot up..."
           for i in {1..30}; do
             if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
               echo "✅ Ollama is ready."
@@ -52,12 +52,12 @@ jobs:
           cat /tmp/ollama.log || true
           exit 1
 
-      - name: Pull Qwen model
+      - name: Pull Qwen 2.5 Model
         run: |
           set -e
           ollama pull qwen2.5:3b
 
-      - name: Install Python dependencies
+      - name: Install Python Libraries
         run: |
           set -e
           python -m pip install --upgrade pip
@@ -65,12 +65,12 @@ jobs:
           pip install diffusers transformers accelerate
           pip install "tenacity>=8.2.2" requests edge-tts "moviepy==1.0.3" Pillow
 
-      - name: Run 20-30 Min Video Pipeline
+      - name: Execute Frame-by-Frame Generation Pipeline
         run: |
           set -e
           python pipeline.py
 
-      - name: Publish to GitHub Releases
+      - name: Publish Video to GitHub Releases
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -80,10 +80,10 @@ jobs:
             output/video_${COUNT}.mp4 \
             output/thumbnail_${COUNT}.png \
             output/seo_${COUNT}.txt \
-            --title "Stickman Finance Masterclass Episode #${COUNT}" \
-            --notes-file output/seo_${COUNT}.txt || echo "Release created or already exists."
+            --title "Perfect Sync Finance Episode #${COUNT}" \
+            --notes-file output/seo_${COUNT}.txt || echo "Release created."
 
-      - name: Commit and push counter update
+      - name: Update Episode Counter
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
