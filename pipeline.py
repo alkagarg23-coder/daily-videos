@@ -5,6 +5,7 @@ import requests
 import subprocess
 import gc
 import io
+import random
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 from PIL import Image
 
@@ -17,8 +18,6 @@ OLLAMA_MODEL = "qwen2.5:3b"
 PIPER_EXEC = "./piper/piper"
 PIPER_MODEL_PATH = "models/voice.onnx"
 HF_TOKEN = os.getenv("HF_TOKEN", "")
-
-# SDXL API Endpoint
 HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
 
 OUTPUT_DIR = "output"
@@ -27,7 +26,6 @@ IMAGE_DIR = os.path.join(OUTPUT_DIR, "images")
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-# Counter Tracker
 try:
     with open("counter.txt", "r") as f:
         CURRENT_COUNT = int(f.read().strip()) + 1
@@ -37,11 +35,40 @@ with open("counter.txt", "w") as f:
     f.write(str(CURRENT_COUNT))
 
 # ============================================================
-# ZERO-ERROR AUDIO ENGINE (PIPER TTS)
+# MULTI-DIMENSIONAL RANDOM ENGINE (100% MONETIZATION SAFETY)
+# ============================================================
+
+# 1. विजुअल स्टाइल रैंडमाइज़र
+ART_STYLES = [
+    "clean modern corporate flat vector art, minimalist infographic style",
+    "high quality 3D Pixar-style render, vibrant studio lighting, highly detailed animated movie style",
+    "dramatic cinematic comic book illustration, heavy shadows, vivid neon accents",
+    "elegant watercolor painting, soft pastel colors, atmospheric documentary style",
+    "futuristic cyberpunk aesthetic, glowing holographic financial charts, dark moody background",
+    "minimalist continuous line art drawing, elegant luxury corporate aesthetic",
+    "vintage 1920s newspaper editorial sketch, cross-hatch illustration style",
+    "isometric 3D low poly architectural illustration, soft studio clay render"
+]
+
+# 2. सबटाइटल कलर रैंडमाइज़र (पीला, सियान, हरा, सफेद)
+SUBTITLE_COLORS = [
+    "&H0000FFFF",  # Bold Yellow
+    "&H00FFFF00",  # Cyan
+    "&H0000FF00",  # Neon Green
+    "&H00FFFFFF"   # Clean White
+]
+
+CURRENT_VIDEO_STYLE = random.choice(ART_STYLES)
+CURRENT_SUB_COLOR = random.choice(SUBTITLE_COLORS)
+
+print(f"🎨 EPISODE #{CURRENT_COUNT} SELECTED VISUAL STYLE: {CURRENT_VIDEO_STYLE}")
+print(f"🔤 SELECTED SUBTITLE COLOR: {CURRENT_SUB_COLOR}")
+
+# ============================================================
+# LOCAL NEURAL TTS (PIPER)
 # ============================================================
 
 def generate_local_audio(text, output_path):
-    # subprocess.run with input bytes prevents crash if text contains quotes/special characters
     process = subprocess.run(
         [PIPER_EXEC, "--model", PIPER_MODEL_PATH, "--output_file", output_path],
         input=text.encode('utf-8'),
@@ -49,7 +76,6 @@ def generate_local_audio(text, output_path):
         stderr=subprocess.PIPE
     )
     if process.returncode != 0:
-        print(f"⚠️ Piper Warning on text: {text[:30]}... Retrying with safe characters.")
         safe_text = re.sub(r'[^a-zA-Z0-9\s\.,]', '', text)
         subprocess.run(
             [PIPER_EXEC, "--model", PIPER_MODEL_PATH, "--output_file", output_path],
@@ -59,11 +85,10 @@ def generate_local_audio(text, output_path):
         )
 
 # ============================================================
-# CLOUD IMAGE ENGINE (WITH SMART FALLBACK)
+# CLOUD IMAGE ENGINE (HUGGING FACE SDXL + FALLBACK)
 # ============================================================
 
 def create_fallback_image(output_path):
-    """Creates a solid dark cinematic background if API totally fails to prevent pipeline crash."""
     img = Image.new('RGB', (1280, 720), color=(15, 20, 30))
     img.save(output_path)
 
@@ -73,30 +98,27 @@ def generate_cloud_image(prompt_text, output_path):
         return
 
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    clean_prompt = (
-        f"clean modern vector art, 2D minimalist stickman illustration, {prompt_text}, "
-        f"bold clean black outlines, crisp solid light backdrop, corporate doodle infographic, 8k resolution"
-    )
+    clean_prompt = f"{CURRENT_VIDEO_STYLE}, visually showing {prompt_text}, no text, masterpiece, 8k resolution"
     payload = {"inputs": clean_prompt, "parameters": {"guidance_scale": 7.5}}
     
-    for attempt in range(4): # Smart Retries
+    for attempt in range(4): 
         try:
-            response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=40)
+            response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=45)
             if response.status_code == 200:
                 image = Image.open(io.BytesIO(response.content))
                 widescreen = image.resize((1280, 720), Image.Resampling.LANCZOS)
                 widescreen.save(output_path, format="PNG")
-                time.sleep(3) # Safe delay to prevent ban
+                time.sleep(3) # रेट लिमिट से बचने के लिए डिले
                 return
         except Exception:
             pass
         time.sleep(8)
             
-    print(f"⚠️ Image API limit reached for scene. Using fallback visual.")
+    print(f"⚠️ Image generation fallback used for: {output_path}")
     create_fallback_image(output_path)
 
 # ============================================================
-# TEXT GENERATION & TIMING HELPERS
+# LLM & TIMING FUNCTIONS
 # ============================================================
 
 def request_llm(prompt_text):
@@ -115,36 +137,42 @@ def format_srt_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 # ============================================================
-# STEP 1: SCRIPT & ASSET CREATION
+# STEP 1: SCRIPT & ASSETS GENERATION
 # ============================================================
 
-print(f"🚀 GENERATING 30-MIN MASTERCLASS #{CURRENT_COUNT}")
+print(f"🚀 GENERATING MASTERCLASS EPISODE #{CURRENT_COUNT}")
 
-script_prompt = f"Write an engaging 10-chapter YouTube script about escaping the middle-class trap. Use punchy, practical paragraphs. No bullet points or special characters."
+TOPICS = [
+    "escaping the rat race and building wealth",
+    "the psychology of money and financial freedom",
+    "why saving money keeps you broke and how investing changes everything",
+    "the brutal truth about debt and economic cycles"
+]
+chosen_topic = random.choice(TOPICS)
+
+script_prompt = f"Write an engaging 10-chapter YouTube documentary script about {chosen_topic}. Use deep, punchy paragraphs. Do not use bullet points or lists."
 raw_script = request_llm(script_prompt)
 
-# Clean and split into distinct timeline cuts
 raw_script = raw_script.replace('"', '').replace('\n', ' ')
 sentences = re.split(r'(?<=[.!?]) +', raw_script)
 sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
 TOTAL_SCENES = len(sentences)
 
-print(f"🎬 Total Perfect-Sync Cuts: {TOTAL_SCENES}")
+print(f"🎬 Total Perfect-Sync Timeline Cuts: {TOTAL_SCENES}")
 
 for idx, sentence in enumerate(sentences):
     scene_id = str(idx).zfill(4)
     audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_id}.wav")
     image_path = os.path.join(IMAGE_DIR, f"scene_{scene_id}.png")
     
-    print(f"⚙️ Rendering Asset {idx+1}/{TOTAL_SCENES}...")
     generate_local_audio(sentence, audio_path)
     generate_cloud_image(sentence[:90], image_path)
 
 # ============================================================
-# STEP 2: ALTERNATING ZOOM & TIMELINE ASSEMBLY (RAM SAFE)
+# STEP 2: ALTERNATING ZOOM & TIMELINE COMPOSITION
 # ============================================================
 
-print("\n🎞️ BUILDING TIMELINE & KEN BURNS MOTION...")
+print("\n🎞️ COMPOSING TIMELINE WITH ALTERNATING KEN BURNS MOTION...")
 clips = []
 srt_content = ""
 current_time = 0.0
@@ -158,7 +186,6 @@ for idx in range(TOTAL_SCENES):
         audio_clip = AudioFileClip(audio_path)
         dur = audio_clip.duration
         
-        # Subtitle Generation
         start_str = format_srt_time(current_time)
         end_str = format_srt_time(current_time + dur)
         display_text = sentences[idx]
@@ -171,7 +198,6 @@ for idx in range(TOTAL_SCENES):
         srt_content += f"{idx+1}\n{start_str} --> {end_str}\n{display_text}\n\n"
         current_time += dur
         
-        # Alternating Zoom: Even = Zoom-In, Odd = Zoom-Out
         base_clip = ImageClip(image_path).set_duration(dur)
         is_even = (idx % 2 == 0)
         
@@ -200,35 +226,34 @@ if clips:
         fps=15,
         codec="libx264",
         audio_codec="aac",
-        threads=2, # Keeps CPU memory stable on GitHub Actions
+        threads=2, 
         preset="ultrafast",
         logger="bar"
     )
 
-# RAM Cleanup before FFmpeg
+# RAM क्लीनअप
 try:
     final_video.close()
     for c in clips:
         c.close()
 except:
     pass
-gc.collect() 
+gc.collect()
 
 # ============================================================
-# STEP 3: FFMPEG HARDCODED SUBTITLES
+# STEP 3: FFMPEG SUBTITLE BURN-IN
 # ============================================================
 
-print("\n🔥 BURNING KINETIC SUBTITLES...")
+print("\n🔥 BURNING SUBTITLES...")
 final_video_path = os.path.join(OUTPUT_DIR, f"final_video_{CURRENT_COUNT}.mp4")
 
-# Using DejaVu Sans, bold yellow text, black outline for high readability
 ffmpeg_cmd = [
     "ffmpeg", "-y",
     "-i", base_video_path,
-    "-vf", f"subtitles={srt_path}:force_style='FontName=DejaVu Sans,FontSize=24,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=25'",
+    "-vf", f"subtitles={srt_path}:force_style='FontName=DejaVu Sans,FontSize=24,PrimaryColour={CURRENT_SUB_COLOR},OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=25'",
     "-c:a", "copy",
     final_video_path
 ]
 
 subprocess.run(ffmpeg_cmd, check=True)
-print(f"\n✅ FULL MASTERCLASS #{CURRENT_COUNT} CREATED SUCCESSFULLY!")
+print(f"\n✅ EPISODE #{CURRENT_COUNT} CREATED SUCCESSFULLY!")
