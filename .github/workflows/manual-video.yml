@@ -2,9 +2,8 @@ name: Daily Long-Form Video Generator
 
 on:
   schedule:
-    # Roz raat 12:00 UTC (Subah 5:30 AM IST) apne aap chalega
     - cron: '0 0 * * *'
-  workflow_dispatch: # Manually chalane ke liye
+  workflow_dispatch:
 
 permissions:
   contents: write
