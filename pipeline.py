@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import urllib.parse
 import asyncio
 import torch
 import requests
@@ -11,7 +13,7 @@ from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
 
 # ============================================================
-# CONFIG & AUTO COUNTER TRACKING
+# CONFIG & AUTO COUNTER TRACKING (NO API KEYS REQUIRED)
 # ============================================================
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
@@ -42,7 +44,7 @@ print(f"🎯 Starting Long-Form Engine (20-30 Min) for Episode #{CURRENT_COUNT}"
 
 
 # ============================================================
-# LOCAL AI IMAGE ENGINE (SD-TURBO ON VM CPU)
+# LOCAL AI IMAGE ENGINE (SD-TURBO ON VM CPU - NO API KEYS)
 # ============================================================
 
 print("🧠 Loading local SD-Turbo model onto VM CPU...")
@@ -68,46 +70,83 @@ def get_system_font(size):
     return ImageFont.load_default()
 
 
-def generate_local_ai_image(prompt_text, output_path, overlay_text=None):
-    full_prompt = (
-        f"cartoon stickman finance illustration, {prompt_text}, "
-        f"clean bold black lines, high contrast, flat 2d vector style, expressive actions, "
-        f"minimalist art, youtube stickman animation style, plain white background"
+def generate_local_scene_image(prompt_text, output_path):
+    clean_prompt = (
+        f"clean flat vector minimalist stickman line art, {prompt_text}, "
+        f"crisp bold black ink outlines, clean modern graphic design, solid plain light grey background, "
+        f"no realistic human skin, 2D infographic whiteboard animation style, high clarity"
     )
 
     image = pipe(
-        prompt=full_prompt,
+        prompt=clean_prompt,
         num_inference_steps=1,
         guidance_scale=0.0,
         height=512,
         width=512
     ).images[0]
 
-    canvas = Image.new("RGB", (1280, 720), (255, 255, 255))
-    image = image.resize((720, 720))
-    canvas.paste(image, ((1280 - 720) // 2, 0))
+    widescreen = image.resize((1280, 720), Image.Resampling.LANCZOS)
+    widescreen.save(output_path, format="PNG")
+    print(f"   ✅ Scene Image created: {output_path}")
 
-    if overlay_text:
-        draw = ImageDraw.Draw(canvas)
-        font = get_system_font(52)
-        clean_badge = str(overlay_text).upper().strip()
 
-        text_bbox = draw.textbbox((0, 0), clean_badge, font=font)
-        text_w = text_bbox[2] - text_bbox[0]
-        text_h = text_bbox[3] - text_bbox[1]
+def generate_high_ctr_thumbnail(prompt_text, badge_text, color_theme, output_path):
+    print("🎨 Generating 16:9 Thumbnail via Flux...")
 
-        bx, by = 60, 50
-        padding_x, padding_y = 30, 15
-        draw.rectangle(
-            [(bx, by), (bx + text_w + padding_x * 2, by + text_h + padding_y * 2)],
-            fill=(255, 221, 0),
-            outline=(0, 0, 0),
-            width=5
-        )
-        draw.text((bx + padding_x, by + padding_y), clean_badge, fill=(0, 0, 0), font=font)
+    flux_prompt = (
+        f"viral YouTube thumbnail, 16:9 widescreen, {prompt_text}, {color_theme} lighting and atmosphere, "
+        f"modern 3D stylized cartoon character finance concept, expressive dramatic posture, "
+        f"cinematic rim light, high contrast volumetric lighting, 8k resolution, trending on Artstation"
+    )
 
-    canvas.save(output_path, format="PNG")
-    print(f"   ✅ Image ready: {output_path}")
+    encoded = urllib.parse.quote(flux_prompt)
+    seed = int(time.time()) + CURRENT_COUNT * 77
+    flux_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&model=flux&nologo=true&seed={seed}"
+
+    img = None
+    try:
+        res = requests.get(flux_url, timeout=35)
+        res.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(res.content)
+        img = Image.open(output_path).convert("RGB")
+    except Exception as e:
+        print(f"⚠️ Flux cloud request timed out, switching to high-res local fallback: {e}")
+        raw = pipe(
+            prompt=flux_prompt,
+            num_inference_steps=1,
+            guidance_scale=0.0,
+            height=512,
+            width=512
+        ).images[0]
+        img = raw.resize((1280, 720), Image.Resampling.LANCZOS)
+
+    draw = ImageDraw.Draw(img)
+    font = get_system_font(56)
+    badge = str(badge_text).upper().strip()
+
+    bbox = draw.textbbox((0, 0), badge, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    bx, by = 60, 50
+    pad_x, pad_y = 30, 14
+
+    draw.rounded_rectangle(
+        [(bx + 6, by + 6), (bx + tw + pad_x * 2 + 6, by + th + pad_y * 2 + 6)],
+        radius=14,
+        fill=(0, 0, 0, 200)
+    )
+    draw.rounded_rectangle(
+        [(bx, by), (bx + tw + pad_x * 2, by + th + pad_y * 2)],
+        radius=14,
+        fill=(255, 215, 0),
+        outline=(0, 0, 0),
+        width=5
+    )
+    draw.text((bx + pad_x, by + pad_y), badge, fill=(0, 0, 0), font=font)
+
+    img.save(output_path, format="PNG")
+    print(f"✅ Authentic 16:9 Thumbnail saved: {output_path}")
 
 
 # ============================================================
@@ -135,7 +174,7 @@ async def generate_audio(text, output_path):
 
 
 # ============================================================
-# STEP 1: GENERATE OVERALL VIDEO PLAN & OUTLINE
+# STEP 1: GENERATE OVERALL VIDEO PLAN
 # ============================================================
 
 print("=" * 60)
@@ -143,23 +182,23 @@ print(f"🧠 STEP 1: PLANNING 20-30 MINUTE MASTERCLASS #{CURRENT_COUNT}")
 print("=" * 60)
 
 outline_prompt = f"""
-You are an elite YouTube creator making a 25-minute deep-dive Masterclass on Personal Finance Episode #{CURRENT_COUNT}.
-Target Audience: US Citizens.
-Plan 5 comprehensive chapters that cover every aspect in depth (Saving, Investing, Psychology, Debt Traps, Building Wealth).
+You are an elite YouTube creator making a 25-minute deep-dive Masterclass on US Personal Finance Episode #{CURRENT_COUNT}.
+Pick a distinct theme (e.g., Hidden Bank Fees, Credit Score Manipulation, Stock Market Psychology, Retirement Traps, Tax Loopholes).
 
 Return ONLY valid JSON:
 {{
-  "video_title": "Ultimate Financial Masterclass: From Broke to Wealthy",
-  "seo_tags": "personal finance, investing 101, build wealth, financial freedom, money mastery, 401k, roth ira",
-  "description": "A comprehensive 25-minute masterclass covering everything you need to know about money management.",
-  "thumbnail_text": "DON'T BE POOR!",
-  "thumbnail_prompt": "Shocked stickman holding an empty wallet vs wealthy stickman sitting on gold coins, dramatic cartoon",
+  "video_title": "Unique high-CTR title under 60 characters",
+  "seo_tags": "finance, investing, money tips, wealth, 401k, us economy, debt free",
+  "description": "Engaging description with hooks and timestamps.",
+  "thumbnail_badge": "2-3 WORDS ALL CAPS",
+  "thumbnail_visual": "Detailed concept visual of finance dilemma",
+  "thumbnail_color_theme": "neon crimson red and pitch black dramatic contrast",
   "chapters": [
-    "The Dark Psychology of Consumerism & Spending Traps",
-    "The Emergency Fund Blueprint and Cashflow System",
-    "Understanding Debt: Good Debt vs Toxic Debt",
-    "Index Funds & Compound Interest: The Real Math",
-    "Building Multi-Stream Wealth & Long-Term Freedom"
+    "Chapter 1: The First Unspoken Rule",
+    "Chapter 2: The Math They Hide From You",
+    "Chapter 3: The Danger of Normal Habits",
+    "Chapter 4: The Strategic Exit Plan",
+    "Chapter 5: Long-Term Compounding Reality"
   ]
 }}
 """
@@ -167,15 +206,16 @@ Return ONLY valid JSON:
 response = request_json(OLLAMA_URL, {"model": OLLAMA_MODEL, "prompt": outline_prompt, "stream": False, "format": "json"})
 plan_data = json.loads(clean_json_text(response["response"]))
 
-video_title = f"{plan_data.get('video_title', 'Finance Masterclass')} #{CURRENT_COUNT}"
-thumbnail_prompt = plan_data.get("thumbnail_prompt", "Stickman holding money bag with upward financial charts")
-thumbnail_badge = plan_data.get("thumbnail_text", "DON'T BE POOR!")
+video_title = f"{plan_data.get('video_title', 'The Wealth Blueprint')} #{CURRENT_COUNT}"
+thumbnail_visual = plan_data.get("thumbnail_visual", "Stickman standing on pile of gold facing stormy financial clouds")
+thumbnail_badge = plan_data.get("thumbnail_badge", "WAKE UP!")
+color_theme = plan_data.get("thumbnail_color_theme", "deep moody blue with radiant gold highlights")
 chapters = plan_data.get("chapters", [
-    "Chapter 1: The Money Basics",
-    "Chapter 2: Managing Debt",
-    "Chapter 3: Saving Cashflow",
-    "Chapter 4: Smart Investing",
-    "Chapter 5: Wealth Freedom"
+    "Chapter 1: Cashflow Traps",
+    "Chapter 2: The Debt Illusion",
+    "Chapter 3: High Yield Foundations",
+    "Chapter 4: Index Fund Realities",
+    "Chapter 5: The Wealth Endgame"
 ])
 
 print(f"🎬 Title: {video_title}")
@@ -186,9 +226,9 @@ print(f"📚 Chapters: {len(chapters)}")
 # STEP 2: GENERATE THUMBNAIL
 # ============================================================
 
-print("\n🖼️ Generating Masterclass AI Thumbnail...")
+print("\n🖼️ Generating High-CTR Thumbnail...")
 thumbnail_path = os.path.join(OUTPUT_DIR, f"thumbnail_{CURRENT_COUNT}.png")
-generate_local_ai_image(thumbnail_prompt, thumbnail_path, overlay_text=thumbnail_badge)
+generate_high_ctr_thumbnail(thumbnail_visual, thumbnail_badge, color_theme, thumbnail_path)
 
 
 # ============================================================
@@ -203,18 +243,17 @@ for c_idx, chapter_title in enumerate(chapters):
     print("=" * 60)
 
     chapter_prompt = f"""
-Write Chapter {c_idx + 1} for a 25-minute deep-dive YouTube video: "{chapter_title}".
-Target Audience: US audience.
-Provide 7 detailed scenes for this chapter.
-Each scene MUST contain a long, detailed, and educational explanation (around 60 to 90 words per scene).
-Simple conversational English, full of real examples.
+Write Chapter {c_idx + 1}: "{chapter_title}" for a deep-dive finance video.
+Target: US viewers seeking practical wealth management.
+Provide 7 engaging scenes.
+Each scene must have 60 to 90 words of clear, conversational English with real examples.
 
 Return ONLY valid JSON:
 {{
   "scenes": [
     {{
-      "narration": "Deep detailed spoken paragraph (60-90 words)...",
-      "image_prompt": "Stickman character demonstrating this exact concept"
+      "narration": "Detailed conversational spoken paragraph (60-90 words)...",
+      "image_prompt": "Action of stickman illustrating the concept"
     }}
   ]
 }}
@@ -229,7 +268,7 @@ print(f"\n🎬 Total scenes generated for full video: {TOTAL_SCENES}")
 
 
 # ============================================================
-# STEP 4: GENERATE ASSETS (AUDIO + AI IMAGES WITH SAFE KEYS)
+# STEP 4: GENERATE ASSETS WITH SAFE KEYS
 # ============================================================
 
 async def generate_assets():
@@ -238,28 +277,27 @@ async def generate_assets():
         audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_id}.mp3")
         image_path = os.path.join(IMAGE_DIR, f"scene_{scene_id}.png")
 
-        # Bulletproof safe extraction taaki KeyError 'image_prompt' dobara na aaye
         if isinstance(scene, dict):
             narration_text = (
-                scene.get("narration") 
-                or scene.get("text") 
-                or scene.get("script") 
-                or "Understanding money and smart financial habits is key to building wealth."
+                scene.get("narration")
+                or scene.get("text")
+                or scene.get("script")
+                or "Understanding financial habits is the single most important skill for building sustainable wealth."
             )
             image_prompt_text = (
-                scene.get("image_prompt") 
-                or scene.get("prompt") 
-                or scene.get("visual") 
-                or scene.get("image") 
+                scene.get("image_prompt")
+                or scene.get("prompt")
+                or scene.get("visual")
+                or scene.get("image")
                 or narration_text[:60]
             )
         else:
             narration_text = str(scene)
-            image_prompt_text = "Stickman managing finances and growing money"
+            image_prompt_text = "Stickman managing cashflow and growing assets"
 
         print(f"\n⚙️ Rendering Scene {idx + 1}/{TOTAL_SCENES}...")
         await generate_audio(narration_text, audio_path)
-        generate_local_ai_image(image_prompt_text, image_path)
+        generate_local_scene_image(image_prompt_text, image_path)
 
 asyncio.run(generate_assets())
 
@@ -328,5 +366,5 @@ finally:
             pass
 
 print("\n" + "=" * 60)
-print(f"✅ FULL-LENGTH 20-30 MIN MASTERCLASS #{CURRENT_COUNT} ASSEMBLED LOCALLY!")
+print(f"✅ FULL-LENGTH MASTERCLASS #{CURRENT_COUNT} ASSEMBLED LOCALLY!")
 print("=" * 60)
