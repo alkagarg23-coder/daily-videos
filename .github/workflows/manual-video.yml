@@ -2,9 +2,9 @@ name: Daily Long-Form Video Generator
 
 on:
   schedule:
-    # Roz raat 12:00 UTC (5:30 AM IST) apne aap chalega
+    # Roz raat 12:00 UTC (Subah 5:30 AM IST) apne aap chalega
     - cron: '0 0 * * *'
-  workflow_dispatch: # Manually chalane ke liye button
+  workflow_dispatch: # Manually chalane ke liye
 
 permissions:
   contents: write
@@ -12,7 +12,6 @@ permissions:
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
-    # 20-30 minute video processing ke liye aaraam se 3 ghante ka time (180 mins)
     timeout-minutes: 180
 
     steps:
@@ -78,13 +77,12 @@ jobs:
         run: |
           set -e
           COUNT=$(cat counter.txt)
-          # Ye command video ko Mega ki jagah GitHub Releases me daal degi
           gh release create "v${COUNT}" \
             output/video_${COUNT}.mp4 \
             output/thumbnail_${COUNT}.png \
             output/seo_${COUNT}.txt \
             --title "Stickman Finance Masterclass Episode #${COUNT}" \
-            --notes-file output/seo_${COUNT}.txt || echo "Release creation completed."
+            --notes-file output/seo_${COUNT}.txt || echo "Release created or already exists."
 
       - name: Commit and push counter update
         run: |
