@@ -11,7 +11,7 @@ permissions:
 jobs:
   build-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 6 घंटे की फुल लिमिट
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -35,7 +35,6 @@ jobs:
           wget -q https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz
           tar -xzf piper_amd64.tar.gz
           mkdir -p models
-          # Downloading premium Bryce Medium voice model
           wget -q -O models/voice.onnx https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/bryce/medium/en_US-bryce-medium.onnx
           wget -q -O models/voice.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/bryce/medium/en_US-bryce-medium.onnx.json
 
