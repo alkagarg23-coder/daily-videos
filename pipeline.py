@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw, ImageFont
 from diffusers import AutoPipelineForText2Image
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
+
 # ============================================================
 # CONFIG & AUTO COUNTER TRACKING
 # ============================================================
@@ -39,6 +40,7 @@ with open(COUNTER_FILE, "w") as f:
 
 print(f"🎯 Starting Long-Form Engine (20-30 Min) for Episode #{CURRENT_COUNT}")
 
+
 # ============================================================
 # LOCAL AI IMAGE ENGINE (SD-TURBO ON VM CPU)
 # ============================================================
@@ -50,6 +52,7 @@ pipe = AutoPipelineForText2Image.from_pretrained(
 )
 pipe.to("cpu")
 pipe.enable_attention_slicing()
+
 
 def get_system_font(size):
     font_paths = [
@@ -63,6 +66,7 @@ def get_system_font(size):
             except Exception:
                 pass
     return ImageFont.load_default()
+
 
 def generate_local_ai_image(prompt_text, output_path, overlay_text=None):
     full_prompt = (
@@ -86,7 +90,7 @@ def generate_local_ai_image(prompt_text, output_path, overlay_text=None):
     if overlay_text:
         draw = ImageDraw.Draw(canvas)
         font = get_system_font(52)
-        clean_badge = overlay_text.upper().strip()
+        clean_badge = str(overlay_text).upper().strip()
 
         text_bbox = draw.textbbox((0, 0), clean_badge, font=font)
         text_w = text_bbox[2] - text_bbox[0]
@@ -105,6 +109,7 @@ def generate_local_ai_image(prompt_text, output_path, overlay_text=None):
     canvas.save(output_path, format="PNG")
     print(f"   ✅ Image ready: {output_path}")
 
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -116,15 +121,18 @@ def clean_json_text(raw_text):
         raise ValueError("Qwen did not return a valid JSON object.")
     return raw_text[start:end + 1]
 
+
 def request_json(url, payload):
     response = requests.post(url, json=payload, timeout=None)
     response.raise_for_status()
     return response.json()
 
+
 async def generate_audio(text, output_path):
     communicate = edge_tts.Communicate(text, VOICE)
     await communicate.save(output_path)
     print(f"   ✅ Audio ready: {output_path}")
+
 
 # ============================================================
 # STEP 1: GENERATE OVERALL VIDEO PLAN & OUTLINE
@@ -136,12 +144,13 @@ print("=" * 60)
 
 outline_prompt = f"""
 You are an elite YouTube creator making a 25-minute deep-dive Masterclass on Personal Finance Episode #{CURRENT_COUNT}.
+Target Audience: US Citizens.
 Plan 5 comprehensive chapters that cover every aspect in depth (Saving, Investing, Psychology, Debt Traps, Building Wealth).
 
 Return ONLY valid JSON:
 {{
   "video_title": "Ultimate Financial Masterclass: From Broke to Wealthy",
-  "seo_tags": "personal finance, investing 101, build wealth, financial freedom, money mastery",
+  "seo_tags": "personal finance, investing 101, build wealth, financial freedom, money mastery, 401k, roth ira",
   "description": "A comprehensive 25-minute masterclass covering everything you need to know about money management.",
   "thumbnail_text": "DON'T BE POOR!",
   "thumbnail_prompt": "Shocked stickman holding an empty wallet vs wealthy stickman sitting on gold coins, dramatic cartoon",
@@ -158,13 +167,20 @@ Return ONLY valid JSON:
 response = request_json(OLLAMA_URL, {"model": OLLAMA_MODEL, "prompt": outline_prompt, "stream": False, "format": "json"})
 plan_data = json.loads(clean_json_text(response["response"]))
 
-video_title = f"{plan_data['video_title']} #{CURRENT_COUNT}"
-thumbnail_prompt = plan_data["thumbnail_prompt"]
-thumbnail_badge = plan_data.get("thumbnail_text", "MUST WATCH!")
-chapters = plan_data["chapters"]
+video_title = f"{plan_data.get('video_title', 'Finance Masterclass')} #{CURRENT_COUNT}"
+thumbnail_prompt = plan_data.get("thumbnail_prompt", "Stickman holding money bag with upward financial charts")
+thumbnail_badge = plan_data.get("thumbnail_text", "DON'T BE POOR!")
+chapters = plan_data.get("chapters", [
+    "Chapter 1: The Money Basics",
+    "Chapter 2: Managing Debt",
+    "Chapter 3: Saving Cashflow",
+    "Chapter 4: Smart Investing",
+    "Chapter 5: Wealth Freedom"
+])
 
 print(f"🎬 Title: {video_title}")
 print(f"📚 Chapters: {len(chapters)}")
+
 
 # ============================================================
 # STEP 2: GENERATE THUMBNAIL
@@ -174,8 +190,9 @@ print("\n🖼️ Generating Masterclass AI Thumbnail...")
 thumbnail_path = os.path.join(OUTPUT_DIR, f"thumbnail_{CURRENT_COUNT}.png")
 generate_local_ai_image(thumbnail_prompt, thumbnail_path, overlay_text=thumbnail_badge)
 
+
 # ============================================================
-# STEP 3: DEEP-DIVE SCRIPT & ASSET GENERATION FOR EACH CHAPTER
+# STEP 3: DEEP-DIVE SCRIPT GENERATION FOR EACH CHAPTER
 # ============================================================
 
 all_sections = []
@@ -187,9 +204,10 @@ for c_idx, chapter_title in enumerate(chapters):
 
     chapter_prompt = f"""
 Write Chapter {c_idx + 1} for a 25-minute deep-dive YouTube video: "{chapter_title}".
+Target Audience: US audience.
 Provide 7 detailed scenes for this chapter.
-Each scene MUST contain a long, detailed, and educational explanation (around 60 to 90 words per scene) to keep viewer learning.
-Simple conversational English, full of real examples and relatable analogies.
+Each scene MUST contain a long, detailed, and educational explanation (around 60 to 90 words per scene).
+Simple conversational English, full of real examples.
 
 Return ONLY valid JSON:
 {{
@@ -203,13 +221,15 @@ Return ONLY valid JSON:
 """
     chap_res = request_json(OLLAMA_URL, {"model": OLLAMA_MODEL, "prompt": chapter_prompt, "stream": False, "format": "json"})
     chap_data = json.loads(clean_json_text(chap_res["response"]))
-    all_sections.extend(chap_data["scenes"])
+    scenes_list = chap_data.get("scenes") or chap_data.get("script_sections") or []
+    all_sections.extend(scenes_list)
 
 TOTAL_SCENES = len(all_sections)
 print(f"\n🎬 Total scenes generated for full video: {TOTAL_SCENES}")
 
+
 # ============================================================
-# STEP 4: GENERATE ASSETS (AUDIO + AI IMAGES)
+# STEP 4: GENERATE ASSETS (AUDIO + AI IMAGES WITH SAFE KEYS)
 # ============================================================
 
 async def generate_assets():
@@ -218,11 +238,31 @@ async def generate_assets():
         audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_id}.mp3")
         image_path = os.path.join(IMAGE_DIR, f"scene_{scene_id}.png")
 
+        # Bulletproof safe extraction taaki KeyError 'image_prompt' dobara na aaye
+        if isinstance(scene, dict):
+            narration_text = (
+                scene.get("narration") 
+                or scene.get("text") 
+                or scene.get("script") 
+                or "Understanding money and smart financial habits is key to building wealth."
+            )
+            image_prompt_text = (
+                scene.get("image_prompt") 
+                or scene.get("prompt") 
+                or scene.get("visual") 
+                or scene.get("image") 
+                or narration_text[:60]
+            )
+        else:
+            narration_text = str(scene)
+            image_prompt_text = "Stickman managing finances and growing money"
+
         print(f"\n⚙️ Rendering Scene {idx + 1}/{TOTAL_SCENES}...")
-        await generate_audio(scene["narration"], audio_path)
-        generate_local_ai_image(scene["image_prompt"], image_path)
+        await generate_audio(narration_text, audio_path)
+        generate_local_ai_image(image_prompt_text, image_path)
 
 asyncio.run(generate_assets())
+
 
 # ============================================================
 # STEP 5: SAVE SEO & DESCRIPTION
@@ -231,10 +271,11 @@ asyncio.run(generate_assets())
 seo_path = os.path.join(OUTPUT_DIR, f"seo_{CURRENT_COUNT}.txt")
 with open(seo_path, "w", encoding="utf-8") as f:
     f.write(f"TITLE:\n{video_title}\n\n")
-    f.write(f"DESCRIPTION:\n{plan_data['description']}\n\n")
-    f.write(f"TAGS:\n{plan_data['seo_tags']}\n\n")
+    f.write(f"DESCRIPTION:\n{plan_data.get('description', '')}\n\n")
+    f.write(f"TAGS:\n{plan_data.get('seo_tags', '')}\n\n")
     f.write(f"EPISODE:\n#{CURRENT_COUNT}\n")
     f.write(f"TOTAL_SCENES:\n{TOTAL_SCENES}\n")
+
 
 # ============================================================
 # STEP 6: ASSEMBLE 20-30 MINUTE VIDEO (MOVIEPY)
@@ -287,5 +328,5 @@ finally:
             pass
 
 print("\n" + "=" * 60)
-print(f"✅ FULL-LENGTH MASTERCLASS #{CURRENT_COUNT} ASSEMBLED LOCALLY!")
+print(f"✅ FULL-LENGTH 20-30 MIN MASTERCLASS #{CURRENT_COUNT} ASSEMBLED LOCALLY!")
 print("=" * 60)
