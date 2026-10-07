@@ -46,11 +46,11 @@ jobs:
           sleep 10
           ollama pull qwen2.5:3b
 
-      - name: Install Python Libraries
+      - name: Install Python Libraries (Fixed Pillow Version)
         run: |
           set -e
           python -m pip install --upgrade pip
-          pip install requests "moviepy==1.0.3" Pillow
+          pip install requests "moviepy==1.0.3" "Pillow==9.5.0"
 
       - name: Execute Core Video Pipeline
         env:
