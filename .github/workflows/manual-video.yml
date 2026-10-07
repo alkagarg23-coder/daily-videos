@@ -1,4 +1,4 @@
-name: Perfect-Sync Timeline Video Engine
+name: 30-Min Masterclass Production (Zero-Error Engine)
 
 on:
   schedule:
@@ -9,84 +9,71 @@ permissions:
   contents: write
 
 jobs:
-  generate-and-upload:
+  build-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 6 hours max limit allowed for 300-400 images
+    timeout-minutes: 360 # 6 घंटे की फुल लिमिट
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install System Dependencies (FFmpeg & Fonts)
+      - name: Install System Dependencies & FFmpeg
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          sudo apt-get install -y ffmpeg fonts-dejavu-core wget tar
           ffmpeg -version
 
-      - name: Install Ollama (Local LLM Engine)
+      - name: Setup Piper TTS (Local Neural Voice)
+        run: |
+          set -e
+          wget -q https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz
+          tar -xzf piper_amd64.tar.gz
+          mkdir -p models
+          # Downloading premium Bryce Medium voice model
+          wget -q -O models/voice.onnx https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/bryce/medium/en_US-bryce-medium.onnx
+          wget -q -O models/voice.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/bryce/medium/en_US-bryce-medium.onnx.json
+
+      - name: Setup Ollama (Local AI Scriptwriter)
         run: |
           set -e
           curl -fsSL https://ollama.com/install.sh | sh
-          ollama --version
-
-      - name: Start Ollama Background Service
-        run: |
-          set -e
           ollama serve > /tmp/ollama.log 2>&1 &
-          echo "Waiting for Ollama to boot up..."
-          for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
-              echo "✅ Ollama is ready."
-              exit 0
-            fi
-            echo "Waiting... $i/30"
-            sleep 2
-          done
-          echo "❌ Ollama failed to start."
-          cat /tmp/ollama.log || true
-          exit 1
-
-      - name: Pull Qwen 2.5 Model
-        run: |
-          set -e
+          sleep 10
           ollama pull qwen2.5:3b
 
       - name: Install Python Libraries
         run: |
           set -e
           python -m pip install --upgrade pip
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install diffusers transformers accelerate
-          pip install "tenacity>=8.2.2" requests edge-tts "moviepy==1.0.3" Pillow
+          pip install requests "moviepy==1.0.3" Pillow
 
-      - name: Execute Frame-by-Frame Generation Pipeline
+      - name: Execute Core Video Pipeline
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -e
           python pipeline.py
 
-      - name: Publish Video to GitHub Releases
+      - name: Publish Final Video to Releases
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           COUNT=$(cat counter.txt)
           gh release create "v${COUNT}" \
-            output/video_${COUNT}.mp4 \
-            output/thumbnail_${COUNT}.png \
-            output/seo_${COUNT}.txt \
-            --title "Perfect Sync Finance Episode #${COUNT}" \
-            --notes-file output/seo_${COUNT}.txt || echo "Release created."
+            output/final_video_${COUNT}.mp4 \
+            --title "Pro Finance Masterclass Episode #${COUNT}" || echo "Release created."
 
-      - name: Update Episode Counter
+      - name: Auto-Update Episode Counter
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add counter.txt
-          git commit -m "Auto-update video counter [skip ci]" || echo "No changes to commit"
+          git commit -m "Auto-update counter [skip ci]" || echo "No changes"
           git push
