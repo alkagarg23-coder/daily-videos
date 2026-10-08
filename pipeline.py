@@ -22,7 +22,7 @@ HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-dif
 OUTPUT_DIR = "output"
 AUDIO_DIR = os.path.join(OUTPUT_DIR, "audio")
 IMAGE_DIR = os.path.join(OUTPUT_DIR, "images")
-SCENES_DIR = os.path.join(OUTPUT_DIR, "scenes") # New folder for FFmpeg chunks
+SCENES_DIR = os.path.join(OUTPUT_DIR, "scenes")
 
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
@@ -61,13 +61,13 @@ print(f"🔤 SUBTITLE COLOR: {CURRENT_SUB_COLOR}")
 # KOKORO TTS (LOADED ONCE)
 # ============================================================
 print("🧠 Loading Kokoro ONNX Engine (am_michael)...")
-kokoro_tts = Kokoro("kokoro-v0_19.onnx", "voices.json")
+kokoro_tts = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
 
 def generate_local_audio(text, output_path):
     try:
         samples, sample_rate = kokoro_tts.create(text, voice="am_michael", speed=1.0, lang="en-us")
         sf.write(output_path, samples, sample_rate)
-        return len(samples) / sample_rate # Return exact duration
+        return len(samples) / sample_rate
     except Exception as e:
         safe_text = re.sub(r'[^a-zA-Z0-9\s\.,]', '', text)
         samples, sample_rate = kokoro_tts.create(safe_text, voice="am_michael", speed=1.0, lang="en-us")
@@ -139,7 +139,7 @@ TOPICS = [
 chosen_topic = random.choice(TOPICS)
 
 full_script = ""
-total_chapters = 8 # Will generate approx 25-30 minutes
+total_chapters = 8
 
 print("📝 Writing Script locally with Llama 3.2...")
 
@@ -171,11 +171,9 @@ for idx, sentence in enumerate(sentences):
     image_path = os.path.join(IMAGE_DIR, f"scene_{scene_id}.png")
     scene_video_path = os.path.join(SCENES_DIR, f"scene_{scene_id}.mp4")
     
-    # 1. Generate Assets
     dur = generate_local_audio(sentence, audio_path)
     generate_cloud_image(sentence[:90], image_path)
     
-    # 2. Build Kinetic Subtitles (Word-by-word)
     words = sentence.split()
     num_words = len(words)
     if num_words > 0:
@@ -190,9 +188,7 @@ for idx, sentence in enumerate(sentences):
             
     current_time += dur
     
-    # 3. Direct FFmpeg Video Generation (Uses Zero RAM!)
-    # Applying continuous slow zoompan for a professional look at 15fps
-    frames = int(dur * 15) + 5 # Add buffer frames
+    frames = int(dur * 15) + 5
     ffmpeg_chunk_cmd = [
         "ffmpeg", "-y", "-loop", "1",
         "-i", image_path,
@@ -205,7 +201,6 @@ for idx, sentence in enumerate(sentences):
     
     subprocess.run(ffmpeg_chunk_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
-    # Add to list for final join
     if os.path.exists(scene_video_path):
         concat_lines.append(f"file 'scenes/scene_{scene_id}.mp4'")
         print(f"✅ Rendered Cut {idx+1}/{TOTAL_SCENES}")
@@ -224,7 +219,6 @@ with open(srt_path, "w", encoding="utf-8") as f:
 
 raw_video_path = os.path.join(OUTPUT_DIR, f"raw_video_{CURRENT_COUNT}.mp4")
 
-# Combine all small videos into one instantly without re-encoding
 ffmpeg_concat_cmd = [
     "ffmpeg", "-y", "-f", "concat", "-safe", "0",
     "-i", concat_file_path,
