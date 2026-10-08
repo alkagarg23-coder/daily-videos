@@ -189,9 +189,9 @@ class LLMEngine:
         prompt = (
             f"Generate YouTube SEO metadata for a deep documentary about: '{topic}'.\n"
             f"Respond EXACTLY in this format, nothing else:\n\n"
-            f"TITLE: [Your highly clickable title here]\n"
-            f"DESCRIPTION: [A 3-sentence engaging description here]\n"
-            f"TAGS: [comma, separated, tags, here]"
+            f"TITLE: [Your highly clickable, SEO-optimized title here]\n"
+            f"DESCRIPTION: [Write a highly engaging description of exactly around 500 characters. Use plenty of relevant emojis like 🚀💰📉🔥. Include a call to action to subscribe.]\n"
+            f"TAGS: [comma, separated, high-volume, tags, here]"
         )
         return LLMEngine.execute_prompt(prompt, retries=2)
 
@@ -469,9 +469,4 @@ class RenderEngine:
 class MasterclassPipeline:
     def __init__(self):
         Logger.info(f"--- BOOTING PIPELINE ENGINE FOR EPISODE {CURRENT_EPISODE} ---")
-        self.audio_engine = LocalAudioEngine()
-        self.sub_engine = SubtitleEngine()
-        
-    def run(self):
-        topics = [
-          
+    
