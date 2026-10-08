@@ -35,28 +35,30 @@ jobs:
           wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.onnx
           wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin
 
-      - name: Setup Ollama (Gemma2:2b for Ultra-Fast CPU Scripts)
-        run: |
-          set -e
-          curl -fsSL https://ollama.com/install.sh | sh
-          ollama serve > /tmp/ollama.log 2>&1 &
-          sleep 10
-          ollama pull gemma2:2b
-
       - name: Install Python Libraries
         run: |
           set -e
           python -m pip install --upgrade pip
           pip install requests "Pillow==9.5.0" kokoro-onnx soundfile
 
-      - name: Execute Core Video Pipeline
+      - name: Execute Complete Pipeline (AI Server + Python)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -e
+          
+          echo "🚀 Starting Local AI Server (Ollama)..."
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve > /tmp/ollama.log 2>&1 &
+          sleep 10
+          
+          echo "🧠 Pulling AI Model (gemma2:2b)..."
+          ollama pull gemma2:2b
+          
+          echo "🎬 Running Python Video Engine..."
           python -u pipeline.py
 
-      - name: Publish Final Video to Releases
+      - name: Publish Final Video & SEO to Releases
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -64,6 +66,7 @@ jobs:
           COUNT=$(cat counter.txt)
           gh release create "v${COUNT}" \
             output/final_video_${COUNT}.mp4 \
+            output/seo_metadata_${COUNT}.txt \
             --title "Pro Finance Masterclass Episode #${COUNT}" || echo "Release created."
 
       - name: Auto-Update Episode Counter
