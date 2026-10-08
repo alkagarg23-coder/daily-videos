@@ -35,10 +35,9 @@ with open("counter.txt", "w") as f:
     f.write(str(CURRENT_COUNT))
 
 # ============================================================
-# MULTI-DIMENSIONAL RANDOM ENGINE (100% MONETIZATION SAFETY)
+# MULTI-DIMENSIONAL RANDOM ENGINE
 # ============================================================
 
-# 1. विजुअल स्टाइल रैंडमाइज़र
 ART_STYLES = [
     "clean modern corporate flat vector art, minimalist infographic style",
     "high quality 3D Pixar-style render, vibrant studio lighting, highly detailed animated movie style",
@@ -50,7 +49,6 @@ ART_STYLES = [
     "isometric 3D low poly architectural illustration, soft studio clay render"
 ]
 
-# 2. सबटाइटल कलर रैंडमाइज़र (पीला, सियान, हरा, सफेद)
 SUBTITLE_COLORS = [
     "&H0000FFFF",  # Bold Yellow
     "&H00FFFF00",  # Cyan
@@ -85,7 +83,7 @@ def generate_local_audio(text, output_path):
         )
 
 # ============================================================
-# CLOUD IMAGE ENGINE (HUGGING FACE SDXL + FALLBACK)
+# CLOUD IMAGE ENGINE
 # ============================================================
 
 def create_fallback_image(output_path):
@@ -108,7 +106,7 @@ def generate_cloud_image(prompt_text, output_path):
                 image = Image.open(io.BytesIO(response.content))
                 widescreen = image.resize((1280, 720), Image.Resampling.LANCZOS)
                 widescreen.save(output_path, format="PNG")
-                time.sleep(3) # रेट लिमिट से बचने के लिए डिले
+                time.sleep(3) 
                 return
         except Exception:
             pass
@@ -150,7 +148,13 @@ TOPICS = [
 ]
 chosen_topic = random.choice(TOPICS)
 
-script_prompt = f"Write an engaging 10-chapter YouTube documentary script about {chosen_topic}. Use deep, punchy paragraphs. Do not use bullet points or lists."
+# 30-minute script prompt (Forcing the LLM to write more)
+script_prompt = (
+    f"Write a very long, highly detailed, 30-minute documentary script about {chosen_topic}. "
+    f"It MUST be at least 4000 words. Divide it into 15 chapters. Each chapter MUST have at least 3 deep, "
+    f"punchy paragraphs explaining concepts in detail with examples. "
+    f"Do NOT use bullet points or lists. Make it sound like a premium finance documentary."
+)
 raw_script = request_llm(script_prompt)
 
 raw_script = raw_script.replace('"', '').replace('\n', ' ')
@@ -176,6 +180,7 @@ print("\n🎞️ COMPOSING TIMELINE WITH ALTERNATING KEN BURNS MOTION...")
 clips = []
 srt_content = ""
 current_time = 0.0
+subtitle_index = 1
 
 for idx in range(TOTAL_SCENES):
     scene_id = str(idx).zfill(4)
@@ -186,16 +191,21 @@ for idx in range(TOTAL_SCENES):
         audio_clip = AudioFileClip(audio_path)
         dur = audio_clip.duration
         
-        start_str = format_srt_time(current_time)
-        end_str = format_srt_time(current_time + dur)
-        display_text = sentences[idx]
-        if len(display_text) > 42:
-            mid = len(display_text) // 2
-            split_at = display_text.find(" ", mid)
-            if split_at != -1:
-                display_text = display_text[:split_at] + "\n" + display_text[split_at+1:]
+        # Word-by-word (Kinetic) Subtitles Logic
+        words = sentences[idx].split()
+        num_words = len(words)
         
-        srt_content += f"{idx+1}\n{start_str} --> {end_str}\n{display_text}\n\n"
+        if num_words > 0:
+            word_duration = dur / num_words
+            word_time = current_time
+            
+            for word in words:
+                start_str = format_srt_time(word_time)
+                end_str = format_srt_time(word_time + word_duration)
+                srt_content += f"{subtitle_index}\n{start_str} --> {end_str}\n{word}\n\n"
+                subtitle_index += 1
+                word_time += word_duration
+
         current_time += dur
         
         base_clip = ImageClip(image_path).set_duration(dur)
@@ -231,7 +241,6 @@ if clips:
         logger="bar"
     )
 
-# RAM क्लीनअप
 try:
     final_video.close()
     for c in clips:
@@ -241,16 +250,17 @@ except:
 gc.collect()
 
 # ============================================================
-# STEP 3: FFMPEG SUBTITLE BURN-IN
+# STEP 3: FFMPEG SUBTITLE BURN-IN WITH ANIMATION
 # ============================================================
 
-print("\n🔥 BURNING SUBTITLES...")
+print("\n🔥 BURNING KINETIC SUBTITLES...")
 final_video_path = os.path.join(OUTPUT_DIR, f"final_video_{CURRENT_COUNT}.mp4")
 
+# Added simple 'pop' animation using ASS tags for subtitles
 ffmpeg_cmd = [
     "ffmpeg", "-y",
     "-i", base_video_path,
-    "-vf", f"subtitles={srt_path}:force_style='FontName=DejaVu Sans,FontSize=24,PrimaryColour={CURRENT_SUB_COLOR},OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=25'",
+    "-vf", f"subtitles={srt_path}:force_style='FontName=DejaVu Sans,FontSize=48,PrimaryColour={CURRENT_SUB_COLOR},OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=2,Alignment=2,MarginV=35'",
     "-c:a", "copy",
     final_video_path
 ]
