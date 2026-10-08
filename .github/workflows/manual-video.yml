@@ -21,39 +21,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip' # ⚡ Caches Python packages too!
 
       - name: Install Advanced System Dependencies
         run: |
           set -e
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-dejavu-core espeak-ng wget imagemagick
+          ffmpeg -version
 
-      # ⚡ CACHE 1: KOKORO ONNX MODELS
-      - name: Cache Kokoro Models
-        id: cache-kokoro
-        uses: actions/cache@v4
-        with:
-          path: |
-            kokoro-v1.0.onnx
-            voices-v1.0.bin
-          key: kokoro-v1-models
-
-      - name: Fetch Local TTS Models (If Not Cached)
-        if: steps.cache-kokoro.outputs.cache-hit != 'true'
+      - name: Fetch Local TTS Neural Models
         run: |
           set -e
-          echo "Cache miss. Downloading Kokoro models..."
           wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.onnx
           wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin
-
-      # ⚡ CACHE 2: OLLAMA AI MODELS
-      - name: Cache Ollama Models
-        id: cache-ollama
-        uses: actions/cache@v4
-        with:
-          path: ~/.ollama
-          key: ollama-gemma2-2b-model
 
       - name: Install Python Software Engine
         run: |
@@ -76,9 +56,8 @@ jobs:
           echo "WAITING FOR OLLAMA TO BOOT..."
           sleep 15
           
-          # Only pull if model isn't in cache
-          echo "PULLING GEMMA2:2B AI SCRIPTWRITER (IF NEEDED)..."
-          ollama list | grep "gemma2:2b" || ollama pull gemma2:2b
+          echo "PULLING GEMMA2:2B AI SCRIPTWRITER..."
+          ollama pull gemma2:2b
           
           echo "========================================="
           echo "IGNITING PYTHON ENTERPRISE ENGINE"
