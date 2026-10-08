@@ -1,4 +1,4 @@
-name: Ultimate 30-Min Finance Engine (Enterprise)
+name: Ultimate 30-Min Local Finance Engine
 
 on:
   schedule:
@@ -22,49 +22,50 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Advanced System Dependencies
+      - name: Install System Tools & FFmpeg
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu espeak-ng wget imagemagick
-          ffmpeg -version
+          sudo apt-get install -y ffmpeg fonts-dejavu espeak-ng wget build-essential cmake
+          
+      - name: Build Local SD Engine & Fetch Dreamshaper v8
+        run: |
+          set -e
+          git clone --recursive https://github.com/leejet/stable-diffusion.cpp
+          cd stable-diffusion.cpp
+          mkdir build && cd build
+          cmake .. && cmake --build . --config Release
+          cp bin/sd ../../sd
+          cd ../../
+          echo "Downloading High-Quality Dreamshaper v8..."
+          wget -q https://huggingface.co/Lykon/DreamShaper/resolve/main/DreamShaper_8_pruned.safetensors -O model.safetensors
 
-      - name: Fetch Local TTS Neural Models
+      - name: Fetch Local TTS Models (Kokoro)
         run: |
           set -e
           wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.onnx
           wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin
 
-      - name: Install Python Software Engine
+      - name: Install Python Libraries
         run: |
           set -e
           python -m pip install --upgrade pip
           pip install requests "Pillow==9.5.0" kokoro-onnx soundfile
 
-      - name: 🚀 EXECUTE ENTERPRISE PIPELINE (AI + PYTHON)
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: 🚀 EXECUTE 100% LOCAL PIPELINE
         run: |
           set -e
           
-          echo "========================================="
           echo "STARTING LOCAL AI SERVER (OLLAMA)"
-          echo "========================================="
           curl -fsSL https://ollama.com/install.sh | sh
           ollama serve > /tmp/ollama.log 2>&1 &
-          
-          echo "WAITING FOR OLLAMA TO BOOT..."
           sleep 15
-          
-          echo "PULLING GEMMA2:2B AI SCRIPTWRITER..."
           ollama pull gemma2:2b
           
-          echo "========================================="
           echo "IGNITING PYTHON ENTERPRISE ENGINE"
-          echo "========================================="
           python -u pipeline.py
 
-      - name: Publish Cinematic Release (Video, SEO, Thumbnail)
+      - name: Publish Cinematic Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -74,12 +75,12 @@ jobs:
             output/final_video_${COUNT}.mp4 \
             output/seo_metadata_${COUNT}.txt \
             output/thumbnail_${COUNT}.jpg \
-            --title "Cinematic Finance Documentary Episode #${COUNT}" || echo "Release created."
+            --title "Masterclass Finance Episode #${COUNT}" || echo "Release created."
 
-      - name: Database Auto-Sync (Counter)
+      - name: Auto-Sync Counter
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add counter.txt
-          git commit -m "Auto-update counter [skip ci]" || echo "No changes"
+          git commit -m "Auto-update [skip ci]" || echo "No changes"
           git push
