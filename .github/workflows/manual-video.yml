@@ -35,13 +35,13 @@ jobs:
           wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.onnx
           wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin
 
-      - name: Setup Ollama (Llama 3.2 for Long Scripts)
+      - name: Setup Ollama (Gemma2:2b for Ultra-Fast CPU Scripts)
         run: |
           set -e
           curl -fsSL https://ollama.com/install.sh | sh
           ollama serve > /tmp/ollama.log 2>&1 &
           sleep 10
-          ollama pull llama3.2
+          ollama pull gemma2:2b
 
       - name: Install Python Libraries
         run: |
@@ -54,7 +54,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -e
-          python pipeline.py
+          python -u pipeline.py
 
       - name: Publish Final Video to Releases
         env:
