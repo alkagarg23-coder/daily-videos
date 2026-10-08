@@ -32,8 +32,8 @@ jobs:
       - name: Download Kokoro ONNX Model
         run: |
           set -e
-          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model/kokoro-v0_19.onnx
-          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model/voices.json
+          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.onnx
+          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin
 
       - name: Setup Ollama (Llama 3.2 for Long Scripts)
         run: |
