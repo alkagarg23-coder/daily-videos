@@ -1,25 +1,7 @@
-"""
-================================================================================
-YOUTUBE AUTOMATION PIPELINE - ENTERPRISE EDITION V5 (CINEMATIC)
-================================================================================
-Architecture Overview:
-1. CoreConfig: Centralized configuration management.
-2. AdvancedLogger: Custom logging system with timestamps and visual flags.
-3. TextProcessor: Deep text sanitization and exact sentence slicing.
-4. LLMEngine: Context-aware script generation with Ollama (Self-healing).
-5. CloudVisionEngine: Image generation, exact cropping, and RGB/JPG enforcement (Anti-Black-Screen).
-6. LocalAudioEngine: Kokoro ONNX high-fidelity speech synthesis.
-7. SubtitleEngine: Advanced SubStation Alpha (.ass) with Character-Weighted Timing.
-8. RenderEngine: FFmpeg safe-process execution for zero memory leaks.
-9. Orchestrator: The main brain linking all components together.
-================================================================================
-"""
-
 import os
 import sys
 import re
 import time
-import math
 import random
 import requests
 import subprocess
@@ -35,31 +17,26 @@ import soundfile as sf
 # ==============================================================================
 
 class CoreConfig:
-    # Directories
     ROOT_DIR = os.getcwd()
     OUTPUT_DIR = os.path.join(ROOT_DIR, "output")
     AUDIO_DIR = os.path.join(OUTPUT_DIR, "audio")
     IMAGE_DIR = os.path.join(OUTPUT_DIR, "images")
     SCENES_DIR = os.path.join(OUTPUT_DIR, "scenes")
     
-    # API & Endpoints
     OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
     OLLAMA_MODEL = "gemma2:2b"
     HF_TOKEN = os.getenv("HF_TOKEN", "")
     HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
     
-    # Video & Content Settings
     RESOLUTION = (1280, 720)
     FPS = 15
-    CHAPTERS = 8  # Increased to push video towards 20-30 mins
+    CHAPTERS = 8
     
-    # Subtitles Format (.ASS)
     SUB_FONT = "Arial"
     SUB_SIZE = 55
-    SUB_PRIMARY_COLOR = "&H00FFFFFF"  # Pure White
-    SUB_OUTLINE_COLOR = "&H00000000"  # Pure Black Outline
+    SUB_PRIMARY_COLOR = "&H00FFFFFF"
+    SUB_OUTLINE_COLOR = "&H00000000"
     
-    # Visual Randomizer
     STYLES = [
         "ultra-realistic 8k cinematic photography, documentary style, highly detailed",
         "clean vector illustration, modern corporate finance aesthetic, minimalist",
@@ -68,7 +45,6 @@ class CoreConfig:
         "classic vintage newspaper illustration, cross-hatch style, dramatic"
     ]
 
-# Initialize System Folders
 for folder in [CoreConfig.OUTPUT_DIR, CoreConfig.AUDIO_DIR, CoreConfig.IMAGE_DIR, CoreConfig.SCENES_DIR]:
     os.makedirs(folder, exist_ok=True)
 
@@ -119,20 +95,11 @@ class Logger:
 class TextProcessor:
     @staticmethod
     def clean_for_speech(text):
-        """
-        Strips out ALL markdown, hashtags, bullet points, and special characters.
-        Ensures the TTS engine reads plain, clean English.
-        """
         try:
-            # Remove markdown syntax
             clean = re.sub(r'#|\*|_|`|~|>', '', text)
-            # Remove brackets and their content
             clean = re.sub(r'\[.*?\]|\(.*?\)', '', clean)
-            # Remove URLs
             clean = re.sub(r'http\S+', '', clean)
-            # Remove quotes and hyphens
             clean = clean.replace('"', '').replace('\n', ' ').replace('-', ' ')
-            # Collapse multiple spaces
             clean = re.sub(r'\s+', ' ', clean).strip()
             return clean
         except Exception as e:
@@ -141,10 +108,6 @@ class TextProcessor:
 
     @staticmethod
     def chunk_into_sentences(text):
-        """
-        Intelligently splits text into timeline-friendly sentences.
-        Prevents excessively long or short scenes.
-        """
         try:
             sentences = re.split(r'(?<=[.!?]) +', text)
             valid_sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
@@ -160,7 +123,6 @@ class TextProcessor:
 class LLMEngine:
     @staticmethod
     def execute_prompt(prompt, retries=3):
-        """Communicates with Local Ollama Engine with robust retry logic."""
         payload = {"model": CoreConfig.OLLAMA_MODEL, "prompt": prompt, "stream": False}
         for attempt in range(retries):
             try:
@@ -202,7 +164,6 @@ class LLMEngine:
 class CloudVisionEngine:
     @staticmethod
     def _create_failsafe_image(output_path):
-        """Creates an absolute safe RGB solid color image."""
         try:
             img = Image.new('RGB', CoreConfig.RESOLUTION, color=(20, 25, 35))
             img.save(output_path, format="JPEG", quality=95)
@@ -212,31 +173,22 @@ class CloudVisionEngine:
 
     @staticmethod
     def _process_and_save_image(image_bytes, output_path):
-        """
-        THE MOST CRITICAL FUNCTION TO PREVENT BLACK SCREENS.
-        Forces RGB, exactly crops/resizes to 1280x720, and saves as JPEG (no alpha).
-        """
         try:
-            img = Image.open(BytesIO(image_bytes)).convert("RGB") # KILL ALPHA CHANNEL
-            
-            # Smart Crop to Exactly 16:9
+            img = Image.open(BytesIO(image_bytes)).convert("RGB")
             target_ratio = 16 / 9
             img_ratio = img.width / img.height
             
             if img_ratio > target_ratio:
-                # Image is too wide
                 new_width = int(img.height * target_ratio)
                 offset = (img.width - new_width) // 2
                 img = img.crop((offset, 0, offset + new_width, img.height))
             elif img_ratio < target_ratio:
-                # Image is too tall
                 new_height = int(img.width / target_ratio)
                 offset = (img.height - new_height) // 2
                 img = img.crop((0, offset, img.width, offset + new_height))
                 
-            # Final exact resize
             final_img = img.resize(CoreConfig.RESOLUTION, Image.Resampling.LANCZOS)
-            final_img.save(output_path, format="JPEG", quality=95) # SAVE AS JPG
+            final_img.save(output_path, format="JPEG", quality=95)
             return True
         except Exception as e:
             Logger.error("Image processing pipeline crashed", e)
@@ -258,7 +210,7 @@ class CloudVisionEngine:
                 response = requests.post(CoreConfig.HF_API_URL, headers=headers, json=payload, timeout=60)
                 if response.status_code == 200:
                     if CloudVisionEngine._process_and_save_image(response.content, output_path):
-                        time.sleep(2) # Respect HF rate limits
+                        time.sleep(2)
                         return
                 elif response.status_code == 429:
                     Logger.warn("Vision API Rate Limit. Resting for 15s...")
@@ -285,7 +237,6 @@ class LocalAudioEngine:
             sys.exit(1)
 
     def synthesize_speech(self, text, output_path):
-        """Synthesizes text to speech and returns the exact duration in seconds."""
         clean_text = TextProcessor.clean_for_speech(text)
         if not clean_text:
             clean_text = "Moving on to the next point."
@@ -316,7 +267,6 @@ class SubtitleEngine:
         
     @staticmethod
     def _format_time(seconds):
-        """Converts float seconds into ASS format (H:MM:SS.cc)"""
         h = int(seconds // 3600)
         m = int((seconds % 3600) // 60)
         s = int(seconds % 60)
@@ -326,28 +276,18 @@ class SubtitleEngine:
         return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
     def build_scene_subtitles(self, words, scene_duration, scene_start_time):
-        """
-        THE PERFECT SYNC ALGORITHM.
-        Distributes time based on the length of each word.
-        A 10-letter word stays on screen longer than a 2-letter word.
-        """
         if not words: return
-
         total_chars = sum(len(w) for w in words)
         time_per_char = scene_duration / max(total_chars, 1)
-        
         current_word_start = scene_start_time
         
         for word in words:
             word_duration = len(word) * time_per_char
             word_end = current_word_start + word_duration
-            
             clean_word = word.replace('"', '').replace("'", "\\'")
             start_str = self._format_time(current_word_start)
             end_str = self._format_time(word_end)
             
-            # Advanced Kinetic Pop-In Animation Tag
-            # Starts at 70% scale, expands to 100% smoothly over 150ms
             pop_anim = r"{\fscx70\fscy70\t(0,150,\fscx100\fscy100)}"
             event = f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{pop_anim}{clean_word}"
             
@@ -383,17 +323,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 class RenderEngine:
     @staticmethod
     def render_scene_chunk(image_path, audio_path, output_path, duration):
-        """
-        Renders a tiny 1-sentence video chunk safely.
-        Uses format=yuv420p and explicit scaling to absolutely prevent black screens.
-        """
         cmd = [
             "ffmpeg", "-y", 
             "-loop", "1", 
             "-framerate", str(CoreConfig.FPS),
             "-i", image_path,
             "-i", audio_path,
-            # Extremely safe zoompan logic avoiding 0-frame bugs
             "-vf", f"format=yuv420p,scale=8000:-1,zoompan=z='min(zoom+0.0005,1.15)':d={int(duration*CoreConfig.FPS)+5}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1280x720,fps={CoreConfig.FPS}",
             "-c:v", "libx264", "-preset", "ultrafast",
             "-c:a", "aac", "-b:a", "128k",
@@ -410,7 +345,6 @@ class RenderEngine:
 
     @staticmethod
     def execute_concat(concat_file, output_path):
-        """Instantly joins all chunks together."""
         cmd = [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", concat_file, "-c", "copy", output_path
@@ -423,7 +357,6 @@ class RenderEngine:
 
     @staticmethod
     def burn_kinetic_subtitles(input_video, ass_file, output_video):
-        """Burns the advanced ASS subtitles onto the final video."""
         cmd = [
             "ffmpeg", "-y",
             "-i", input_video,
@@ -439,19 +372,13 @@ class RenderEngine:
 
     @staticmethod
     def generate_youtube_thumbnail(image_path, output_path, episode_num):
-        """Creates a custom YouTube thumbnail from a scene image."""
         try:
             img = Image.open(image_path).convert("RGBA")
-            
-            # Create dark overlay for text readability
             overlay = Image.new('RGBA', img.size, (0, 0, 0, 100))
             img = Image.alpha_composite(img, overlay).convert("RGB")
-            
-            # Attempt to add text
             draw = ImageDraw.Draw(img)
             text = f"FINANCE\nMASTERCLASS\nEP.{episode_num}"
             try:
-                # Try to load a system font
                 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 100)
             except:
                 font = ImageFont.load_default()
@@ -469,4 +396,96 @@ class RenderEngine:
 class MasterclassPipeline:
     def __init__(self):
         Logger.info(f"--- BOOTING PIPELINE ENGINE FOR EPISODE {CURRENT_EPISODE} ---")
-    
+        self.audio_engine = LocalAudioEngine()
+        self.sub_engine = SubtitleEngine()
+        
+    def run(self):
+        topics = [
+            "the dark reality of debt and how to escape the financial rat race forever",
+            "the hidden psychology of money and how rich people truly build lasting wealth",
+            "why saving your money keeps you poor and the exact blueprint to start investing"
+        ]
+        chosen_topic = random.choice(topics)
+        Logger.info(f"Target Subject: {chosen_topic}")
+
+        # --- PHASE 1: INTELLIGENT SCRIPTING ---
+        Logger.info("Initiating Deep Script Generation...")
+        full_script = ""
+        for i in range(1, CoreConfig.CHAPTERS + 1):
+            Logger.info(f"Drafting Chapter {i}/{CoreConfig.CHAPTERS}...")
+            full_script += LLMEngine.generate_chapter(i, CoreConfig.CHAPTERS, chosen_topic) + " "
+
+        sentences = TextProcessor.chunk_into_sentences(full_script)
+        total_scenes = len(sentences)
+        Logger.info(f"Script Finalized. Total Processing Scenes: {total_scenes}")
+
+        # --- PHASE 2: ASSET GENERATION & TIMELINE ASSEMBLY ---
+        timeline_position = 0.0
+        valid_chunks = []
+        thumbnail_base_image = None
+        
+        for idx, sentence in enumerate(sentences):
+            scene_id = f"{idx:04d}"
+            wav_path = os.path.join(CoreConfig.AUDIO_DIR, f"scene_{scene_id}.wav")
+            jpg_path = os.path.join(CoreConfig.IMAGE_DIR, f"scene_{scene_id}.jpg")
+            mp4_path = os.path.join(CoreConfig.SCENES_DIR, f"scene_{scene_id}.mp4")
+
+            # 1. Synthesize Audio & Get Real Text Used
+            duration, spoken_text = self.audio_engine.synthesize_speech(sentence, wav_path)
+            if duration < 0.5:
+                continue
+
+            # 2. Generate Contextual Vision
+            vision_context = spoken_text[:80]
+            CloudVisionEngine.fetch_image(vision_context, jpg_path)
+            
+            if not thumbnail_base_image and os.path.exists(jpg_path):
+                thumbnail_base_image = jpg_path
+
+            # 3. Synchronize Subtitles (Character-Weighted)
+            words = spoken_text.split()
+            self.sub_engine.build_scene_subtitles(words, duration, timeline_position)
+
+            # 4. Render Hardware-Safe Chunk
+            if RenderEngine.render_scene_chunk(jpg_path, wav_path, mp4_path, duration):
+                valid_chunks.append(f"file 'scenes/scene_{scene_id}.mp4'")
+                timeline_position += duration
+
+            if (idx + 1) % 10 == 0 or (idx + 1) == total_scenes:
+                percent = int(((idx + 1) / total_scenes) * 100)
+                Logger.info(f"Rendering Progress: {percent}% ({idx+1}/{total_scenes})")
+
+        # --- PHASE 3: MASTER CONCATENATION ---
+        Logger.info("Initiating Final Master Assembly...")
+        concat_file = os.path.join(CoreConfig.OUTPUT_DIR, "concat.txt")
+        with open(concat_file, "w") as f:
+            f.write("\n".join(valid_chunks))
+
+        ass_file = os.path.join(CoreConfig.OUTPUT_DIR, "master_subs.ass")
+        self.sub_engine.generate_ass_file(ass_file)
+
+        raw_vid = os.path.join(CoreConfig.OUTPUT_DIR, f"raw_vid_{CURRENT_EPISODE}.mp4")
+        final_vid = os.path.join(CoreConfig.OUTPUT_DIR, f"final_video_{CURRENT_EPISODE}.mp4")
+
+                RenderEngine.execute_concat(concat_file, raw_vid)
+        RenderEngine.burn_kinetic_subtitles(raw_vid, ass_file, final_vid)
+
+        # --- PHASE 4: METADATA & EXTRAS ---
+        Logger.info("Compiling SEO Metadata & Thumbnail...")
+        seo_text = LLMEngine.generate_seo_metadata(chosen_topic)
+        with open(os.path.join(CoreConfig.OUTPUT_DIR, f"seo_metadata_{CURRENT_EPISODE}.txt"), "w", encoding="utf-8") as f:
+            f.write(seo_text)
+            
+        if thumbnail_base_image:
+            thumb_path = os.path.join(CoreConfig.OUTPUT_DIR, f"thumbnail_{CURRENT_EPISODE}.jpg")
+            RenderEngine.generate_youtube_thumbnail(thumbnail_base_image, thumb_path, CURRENT_EPISODE)
+
+        Logger.success(f"PIPELINE COMPLETE! Episode {CURRENT_EPISODE} successfully constructed.")
+
+if __name__ == "__main__":
+    try:
+        pipeline = MasterclassPipeline()
+        pipeline.run()
+    except Exception as fatal_error:
+        Logger.error("CRITICAL PIPELINE FAILURE", fatal_error)
+        sys.exit(1)
