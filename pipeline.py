@@ -6,25 +6,27 @@ import subprocess
 import gc
 import io
 import random
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 from PIL import Image
+from kokoro_onnx import Kokoro
+import soundfile as sf
 
 # ============================================================
 # CONFIGURATION & CONSTANTS
 # ============================================================
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5:3b"
-PIPER_EXEC = "./piper/piper"
-PIPER_MODEL_PATH = "models/voice.onnx"
+OLLAMA_MODEL = "llama3.2"
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
 
 OUTPUT_DIR = "output"
 AUDIO_DIR = os.path.join(OUTPUT_DIR, "audio")
 IMAGE_DIR = os.path.join(OUTPUT_DIR, "images")
+SCENES_DIR = os.path.join(OUTPUT_DIR, "scenes") # New folder for FFmpeg chunks
+
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
+os.makedirs(SCENES_DIR, exist_ok=True)
 
 try:
     with open("counter.txt", "r") as f:
@@ -35,7 +37,7 @@ with open("counter.txt", "w") as f:
     f.write(str(CURRENT_COUNT))
 
 # ============================================================
-# MULTI-DIMENSIONAL RANDOM ENGINE
+# MULTI-DIMENSIONAL RANDOM ENGINE 
 # ============================================================
 
 ART_STYLES = [
@@ -43,44 +45,34 @@ ART_STYLES = [
     "high quality 3D Pixar-style render, vibrant studio lighting, highly detailed animated movie style",
     "dramatic cinematic comic book illustration, heavy shadows, vivid neon accents",
     "elegant watercolor painting, soft pastel colors, atmospheric documentary style",
-    "futuristic cyberpunk aesthetic, glowing holographic financial charts, dark moody background",
-    "minimalist continuous line art drawing, elegant luxury corporate aesthetic",
-    "vintage 1920s newspaper editorial sketch, cross-hatch illustration style",
+    "futuristic cyberpunk aesthetic, glowing holographic financial charts",
     "isometric 3D low poly architectural illustration, soft studio clay render"
 ]
 
-SUBTITLE_COLORS = [
-    "&H0000FFFF",  # Bold Yellow
-    "&H00FFFF00",  # Cyan
-    "&H0000FF00",  # Neon Green
-    "&H00FFFFFF"   # Clean White
-]
+SUBTITLE_COLORS = ["&H0000FFFF", "&H00FFFF00", "&H0000FF00", "&H00FFFFFF"]
 
 CURRENT_VIDEO_STYLE = random.choice(ART_STYLES)
 CURRENT_SUB_COLOR = random.choice(SUBTITLE_COLORS)
 
-print(f"🎨 EPISODE #{CURRENT_COUNT} SELECTED VISUAL STYLE: {CURRENT_VIDEO_STYLE}")
-print(f"🔤 SELECTED SUBTITLE COLOR: {CURRENT_SUB_COLOR}")
+print(f"🎨 EPISODE #{CURRENT_COUNT} STYLE: {CURRENT_VIDEO_STYLE}")
+print(f"🔤 SUBTITLE COLOR: {CURRENT_SUB_COLOR}")
 
 # ============================================================
-# LOCAL NEURAL TTS (PIPER)
+# KOKORO TTS (LOADED ONCE)
 # ============================================================
+print("🧠 Loading Kokoro ONNX Engine (am_michael)...")
+kokoro_tts = Kokoro("kokoro-v0_19.onnx", "voices.json")
 
 def generate_local_audio(text, output_path):
-    process = subprocess.run(
-        [PIPER_EXEC, "--model", PIPER_MODEL_PATH, "--output_file", output_path],
-        input=text.encode('utf-8'),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    if process.returncode != 0:
+    try:
+        samples, sample_rate = kokoro_tts.create(text, voice="am_michael", speed=1.0, lang="en-us")
+        sf.write(output_path, samples, sample_rate)
+        return len(samples) / sample_rate # Return exact duration
+    except Exception as e:
         safe_text = re.sub(r'[^a-zA-Z0-9\s\.,]', '', text)
-        subprocess.run(
-            [PIPER_EXEC, "--model", PIPER_MODEL_PATH, "--output_file", output_path],
-            input=safe_text.encode('utf-8'),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        samples, sample_rate = kokoro_tts.create(safe_text, voice="am_michael", speed=1.0, lang="en-us")
+        sf.write(output_path, samples, sample_rate)
+        return len(samples) / sample_rate
 
 # ============================================================
 # CLOUD IMAGE ENGINE
@@ -112,11 +104,10 @@ def generate_cloud_image(prompt_text, output_path):
             pass
         time.sleep(8)
             
-    print(f"⚠️ Image generation fallback used for: {output_path}")
     create_fallback_image(output_path)
 
 # ============================================================
-# LLM & TIMING FUNCTIONS
+# LLM & TIMING HELPERS
 # ============================================================
 
 def request_llm(prompt_text):
@@ -135,7 +126,7 @@ def format_srt_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 # ============================================================
-# STEP 1: SCRIPT & ASSETS GENERATION
+# STEP 1: SCRIPT, ASSETS & FFMPEG CHUNKS (ZERO-RAM ENGINE)
 # ============================================================
 
 print(f"🚀 GENERATING MASTERCLASS EPISODE #{CURRENT_COUNT}")
@@ -143,127 +134,115 @@ print(f"🚀 GENERATING MASTERCLASS EPISODE #{CURRENT_COUNT}")
 TOPICS = [
     "escaping the rat race and building wealth",
     "the psychology of money and financial freedom",
-    "why saving money keeps you broke and how investing changes everything",
-    "the brutal truth about debt and economic cycles"
+    "why saving money keeps you broke and how investing changes everything"
 ]
 chosen_topic = random.choice(TOPICS)
 
-# 30-minute script prompt (Forcing the LLM to write more)
-script_prompt = (
-    f"Write a very long, highly detailed, 30-minute documentary script about {chosen_topic}. "
-    f"It MUST be at least 4000 words. Divide it into 15 chapters. Each chapter MUST have at least 3 deep, "
-    f"punchy paragraphs explaining concepts in detail with examples. "
-    f"Do NOT use bullet points or lists. Make it sound like a premium finance documentary."
-)
-raw_script = request_llm(script_prompt)
+full_script = ""
+total_chapters = 8 # Will generate approx 25-30 minutes
 
-raw_script = raw_script.replace('"', '').replace('\n', ' ')
+print("📝 Writing Script locally with Llama 3.2...")
+
+for chapter_num in range(1, total_chapters + 1):
+    print(f"✍️ Gen Chapter {chapter_num}/{total_chapters}...")
+    chapter_prompt = (
+        f"You are writing a YouTube finance documentary about {chosen_topic}. "
+        f"Write ONLY Chapter {chapter_num}. Make it highly detailed. "
+        f"Write at least 3 long paragraphs. No bullet points or special characters."
+    )
+    full_script += request_llm(chapter_prompt) + " "
+
+raw_script = full_script.replace('"', '').replace('\n', ' ')
 sentences = re.split(r'(?<=[.!?]) +', raw_script)
 sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
 TOTAL_SCENES = len(sentences)
 
-print(f"🎬 Total Perfect-Sync Timeline Cuts: {TOTAL_SCENES}")
+print(f"🎬 Total Cuts to Render: {TOTAL_SCENES}")
+
+srt_content = ""
+current_time = 0.0
+subtitle_index = 1
+concat_lines = []
+concat_file_path = os.path.join(OUTPUT_DIR, "concat.txt")
 
 for idx, sentence in enumerate(sentences):
     scene_id = str(idx).zfill(4)
     audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_id}.wav")
     image_path = os.path.join(IMAGE_DIR, f"scene_{scene_id}.png")
+    scene_video_path = os.path.join(SCENES_DIR, f"scene_{scene_id}.mp4")
     
-    generate_local_audio(sentence, audio_path)
+    # 1. Generate Assets
+    dur = generate_local_audio(sentence, audio_path)
     generate_cloud_image(sentence[:90], image_path)
-
-# ============================================================
-# STEP 2: ALTERNATING ZOOM & TIMELINE COMPOSITION
-# ============================================================
-
-print("\n🎞️ COMPOSING TIMELINE WITH ALTERNATING KEN BURNS MOTION...")
-clips = []
-srt_content = ""
-current_time = 0.0
-subtitle_index = 1
-
-for idx in range(TOTAL_SCENES):
-    scene_id = str(idx).zfill(4)
-    audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_id}.wav")
-    image_path = os.path.join(IMAGE_DIR, f"scene_{scene_id}.png")
-
-    if os.path.exists(audio_path) and os.path.exists(image_path):
-        audio_clip = AudioFileClip(audio_path)
-        dur = audio_clip.duration
-        
-        # Word-by-word (Kinetic) Subtitles Logic
-        words = sentences[idx].split()
-        num_words = len(words)
-        
-        if num_words > 0:
-            word_duration = dur / num_words
-            word_time = current_time
+    
+    # 2. Build Kinetic Subtitles (Word-by-word)
+    words = sentence.split()
+    num_words = len(words)
+    if num_words > 0:
+        word_duration = dur / num_words
+        word_time = current_time
+        for word in words:
+            start_str = format_srt_time(word_time)
+            end_str = format_srt_time(word_time + word_duration)
+            srt_content += f"{subtitle_index}\n{start_str} --> {end_str}\n{word}\n\n"
+            subtitle_index += 1
+            word_time += word_duration
             
-            for word in words:
-                start_str = format_srt_time(word_time)
-                end_str = format_srt_time(word_time + word_duration)
-                srt_content += f"{subtitle_index}\n{start_str} --> {end_str}\n{word}\n\n"
-                subtitle_index += 1
-                word_time += word_duration
+    current_time += dur
+    
+    # 3. Direct FFmpeg Video Generation (Uses Zero RAM!)
+    # Applying continuous slow zoompan for a professional look at 15fps
+    frames = int(dur * 15) + 5 # Add buffer frames
+    ffmpeg_chunk_cmd = [
+        "ffmpeg", "-y", "-loop", "1",
+        "-i", image_path,
+        "-i", audio_path,
+        "-vf", f"zoompan=z='zoom+0.0008':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720,framerate=15",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-shortest",
+        scene_video_path
+    ]
+    
+    subprocess.run(ffmpeg_chunk_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # Add to list for final join
+    if os.path.exists(scene_video_path):
+        concat_lines.append(f"file 'scenes/scene_{scene_id}.mp4'")
+        print(f"✅ Rendered Cut {idx+1}/{TOTAL_SCENES}")
 
-        current_time += dur
-        
-        base_clip = ImageClip(image_path).set_duration(dur)
-        is_even = (idx % 2 == 0)
-        
-        def make_zoom(even_flag):
-            if even_flag:
-                return lambda t: 1.0 + 0.05 * (t / dur)
-            return lambda t: 1.05 - 0.05 * (t / dur)
+# ============================================================
+# STEP 2: FAST CONCATENATION & SUBTITLES (FFMPEG ONLY)
+# ============================================================
 
-        zoomed_clip = (
-            base_clip.resize(make_zoom(is_even))
-            .crop(x_center=640, y_center=360, width=1280, height=720)
-            .set_audio(audio_clip)
-        )
-        clips.append(zoomed_clip)
+print("\n🎞️ JOINING CLIPS (RAM-SAFE CONCATENATION)...")
+with open(concat_file_path, "w") as f:
+    f.write("\n".join(concat_lines))
 
 srt_path = os.path.join(OUTPUT_DIR, "subtitles.srt")
 with open(srt_path, "w", encoding="utf-8") as f:
     f.write(srt_content)
 
-base_video_path = os.path.join(OUTPUT_DIR, f"raw_video_{CURRENT_COUNT}.mp4")
+raw_video_path = os.path.join(OUTPUT_DIR, f"raw_video_{CURRENT_COUNT}.mp4")
 
-if clips:
-    final_video = concatenate_videoclips(clips, method="compose")
-    final_video.write_videofile(
-        base_video_path,
-        fps=15,
-        codec="libx264",
-        audio_codec="aac",
-        threads=2, 
-        preset="ultrafast",
-        logger="bar"
-    )
+# Combine all small videos into one instantly without re-encoding
+ffmpeg_concat_cmd = [
+    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+    "-i", concat_file_path,
+    "-c", "copy",
+    raw_video_path
+]
+subprocess.run(ffmpeg_concat_cmd, check=True)
 
-try:
-    final_video.close()
-    for c in clips:
-        c.close()
-except:
-    pass
-gc.collect()
-
-# ============================================================
-# STEP 3: FFMPEG SUBTITLE BURN-IN WITH ANIMATION
-# ============================================================
-
-print("\n🔥 BURNING KINETIC SUBTITLES...")
+print("\n🔥 BURNING KINETIC SUBTITLES (FINAL PASS)...")
 final_video_path = os.path.join(OUTPUT_DIR, f"final_video_{CURRENT_COUNT}.mp4")
 
-# Added simple 'pop' animation using ASS tags for subtitles
-ffmpeg_cmd = [
+ffmpeg_sub_cmd = [
     "ffmpeg", "-y",
-    "-i", base_video_path,
+    "-i", raw_video_path,
     "-vf", f"subtitles={srt_path}:force_style='FontName=DejaVu Sans,FontSize=48,PrimaryColour={CURRENT_SUB_COLOR},OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=2,Alignment=2,MarginV=35'",
     "-c:a", "copy",
     final_video_path
 ]
+subprocess.run(ffmpeg_sub_cmd, check=True)
 
-subprocess.run(ffmpeg_cmd, check=True)
-print(f"\n✅ EPISODE #{CURRENT_COUNT} CREATED SUCCESSFULLY!")
+print(f"\n✅ FULL 30-MIN MASTERCLASS #{CURRENT_COUNT} CREATED SAFELY!")
