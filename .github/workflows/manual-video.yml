@@ -26,7 +26,7 @@ jobs:
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core espeak-ng wget imagemagick
+          sudo apt-get install -y ffmpeg fonts-dejavu espeak-ng wget imagemagick
           ffmpeg -version
 
       - name: Fetch Local TTS Neural Models
