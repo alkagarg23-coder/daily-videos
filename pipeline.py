@@ -5,12 +5,8 @@ import soundfile as sf
 
 # --- 1. SETUP ---
 for f in ["output/audio", "output/images", "output/scenes"]: os.makedirs(f, exist_ok=True)
-try:
-    with open("counter.txt", "r") as f: EP = int(f.read().strip()) + 1
-except: EP = 1
-with open("counter.txt", "w") as f: f.write(str(EP))
 
-print(f"🚀 STARTING HIGH-QUALITY LOCAL EPISODE {EP}", flush=True)
+print("🚀 STARTING HIGH-QUALITY LOCAL RENDER (STANDALONE VIDEO)", flush=True)
 tts = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
 
 # --- 2. FAST LOCAL ENGINES ---
@@ -27,18 +23,16 @@ def clean_txt(text):
     return re.sub(r'\s+', ' ', c).strip()
 
 def get_local_image(prompt, path):
-    # ⚡ HIGH QUALITY 15-STEPS EXECUTION
     sd_cmd = [
         "./sd", "-m", "model.safetensors",
         "-p", f"masterpiece, extremely detailed, black and white minimalist stickman drawing on a clean whiteboard. {prompt}. authentic youtube explainer style.",
-        "-n", "text, bad anatomy, blurry, messy lines, realistic", # Negative prompt for clean stickman
+        "-n", "text, bad anatomy, blurry, messy lines, realistic", 
         "--steps", "15", "--cfg-scale", "7.0", 
         "-W", "768", "-H", "512", "-o", "temp_out.png"
     ]
     try:
         subprocess.run(sd_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
         img = Image.open("temp_out.png").convert("RGB")
-        # Upscale beautifully to 720p
         img.resize((1280, 720), Image.Resampling.LANCZOS).save(path, format="JPEG", quality=100)
     except Exception as e:
         print(f"Image generation fallback: {e}")
@@ -49,10 +43,9 @@ def format_ass(seconds):
     return f"{h}:{m:02d}:{s:02d}.{min(99, int((seconds - int(seconds)) * 100)):02d}"
 
 # --- 3. HIGH-RETENTION SCRIPT ---
-topic = random.choice(["The dark psychology of debt and escaping the rat race", "Why saving money keeps you poor"])
+topic = random.choice(["The dark psychology of debt and escaping the rat race", "Why saving money keeps you poor", "The hidden secrets of the top 1% wealth builders"])
 script = ""
 for i in range(1, 9):
-    # ⚡ VIRAL HOOK
     if i == 1:
         prompt = f"Write INTRO chapter for a YouTube finance video on '{topic}'. Start with a shocking hook ('99% of people are lied to...'). Make it suspenseful so the viewer watches the whole video. 3 paragraphs. Plain English."
     else:
@@ -80,7 +73,6 @@ for idx, sen in enumerate(sentences):
     get_local_image(safe_sen[:60], jpg)
     if not thumb_img and os.path.exists(jpg) and idx == 2: thumb_img = jpg
 
-    # ⚡ PUNCTUATION AWARE SUBS
     words = safe_sen.split()
     weighted_chars = [len(w) + (5 if w.endswith(',') or w.endswith('.') else 0) for w in words]
     tpc = dur / max(sum(weighted_chars), 1)
@@ -105,10 +97,10 @@ with open("output/concat.txt", "w") as f: f.write("\n".join(chunks))
 ass_head = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1280\nPlayResY: 720\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,65,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,3,2,10,10,50,1\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
 with open("output/subs.ass", "w", encoding="utf-8") as f: f.write(ass_head + "\n".join(ass_events))
 
-subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "output/concat.txt", "-c", "copy", f"output/raw_{EP}.mp4"], check=True)
-subprocess.run(["ffmpeg", "-y", "-i", f"output/raw_{EP}.mp4", "-vf", "ass='output/subs.ass'", "-c:a", "copy", f"output/final_video_{EP}.mp4"], check=True)
+subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "output/concat.txt", "-c", "copy", "output/raw_video.mp4"], check=True)
+subprocess.run(["ffmpeg", "-y", "-i", "output/raw_video.mp4", "-vf", "ass='output/subs.ass'", "-c:a", "copy", "output/final_video.mp4"], check=True)
 
-with open(f"output/seo_metadata_{EP}.txt", "w", encoding="utf-8") as f: 
+with open("output/seo_metadata.txt", "w", encoding="utf-8") as f: 
     f.write(llm(f"Generate SEO for: '{topic}'. FORMAT EXACTLY:\nTITLE: [Clickbait title]\nDESCRIPTION: [500 chars with emojis 🚨🔥💰. Call to subscribe.]\nTAGS: [tags]"))
 
 if thumb_img:
@@ -122,13 +114,13 @@ if thumb_img:
         final_thumb = Image.alpha_composite(img, grad).convert("RGB")
         try: 
             font1 = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 95)
-            font2 = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 75)
+            font2 = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 60)
         except: 
             font1 = font2 = ImageFont.load_default()
             
         draw = ImageDraw.Draw(final_thumb)
         draw.text((50, 280), "STOP", fill=(239, 68, 68), font=font1)
         draw.text((50, 390), "DOING THIS", fill=(250, 204, 21), font=font1)
-        draw.text((50, 500), f"EP.{EP} MASTERCLASS", fill=(255, 255, 255), font=font2)
-        final_thumb.save(f"output/thumbnail_{EP}.jpg", format="JPEG", quality=100)
+        draw.text((50, 500), "FINANCE SECRETS", fill=(255, 255, 255), font=font2) # Episode hٹا दिया
+        final_thumb.save("output/thumbnail.jpg", format="JPEG", quality=100)
     except: pass
