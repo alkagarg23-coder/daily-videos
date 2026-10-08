@@ -3,19 +3,19 @@ import re
 import time
 import requests
 import subprocess
-import gc
 import io
 import random
 from PIL import Image
 from kokoro_onnx import Kokoro
 import soundfile as sf
+import sys
 
 # ============================================================
 # CONFIGURATION & CONSTANTS
 # ============================================================
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-OLLAMA_MODEL = "llama3.2"
+OLLAMA_MODEL = "gemma2:2b"
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
 
@@ -54,14 +54,15 @@ SUBTITLE_COLORS = ["&H0000FFFF", "&H00FFFF00", "&H0000FF00", "&H00FFFFFF"]
 CURRENT_VIDEO_STYLE = random.choice(ART_STYLES)
 CURRENT_SUB_COLOR = random.choice(SUBTITLE_COLORS)
 
-print(f"🎨 EPISODE #{CURRENT_COUNT} STYLE: {CURRENT_VIDEO_STYLE}")
-print(f"🔤 SUBTITLE COLOR: {CURRENT_SUB_COLOR}")
+print(f"🎨 EPISODE #{CURRENT_COUNT} STYLE: {CURRENT_VIDEO_STYLE}", flush=True)
+print(f"🔤 SUBTITLE COLOR: {CURRENT_SUB_COLOR}", flush=True)
 
 # ============================================================
 # KOKORO TTS (LOADED ONCE)
 # ============================================================
-print("🧠 Loading Kokoro ONNX Engine (am_michael)...")
+print("🧠 Loading Kokoro ONNX Engine (am_michael)...", flush=True)
 kokoro_tts = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+print("✅ Kokoro ONNX Engine Loaded Successfully!", flush=True)
 
 def generate_local_audio(text, output_path):
     try:
@@ -70,6 +71,8 @@ def generate_local_audio(text, output_path):
         return len(samples) / sample_rate
     except Exception as e:
         safe_text = re.sub(r'[^a-zA-Z0-9\s\.,]', '', text)
+        if not safe_text.strip():
+            safe_text = "Continuing the financial journey."
         samples, sample_rate = kokoro_tts.create(safe_text, voice="am_michael", speed=1.0, lang="en-us")
         sf.write(output_path, samples, sample_rate)
         return len(samples) / sample_rate
@@ -98,11 +101,11 @@ def generate_cloud_image(prompt_text, output_path):
                 image = Image.open(io.BytesIO(response.content))
                 widescreen = image.resize((1280, 720), Image.Resampling.LANCZOS)
                 widescreen.save(output_path, format="PNG")
-                time.sleep(3) 
+                time.sleep(2) 
                 return
         except Exception:
             pass
-        time.sleep(8)
+        time.sleep(5)
             
     create_fallback_image(output_path)
 
@@ -129,7 +132,7 @@ def format_srt_time(seconds):
 # STEP 1: SCRIPT, ASSETS & FFMPEG CHUNKS (ZERO-RAM ENGINE)
 # ============================================================
 
-print(f"🚀 GENERATING MASTERCLASS EPISODE #{CURRENT_COUNT}")
+print(f"🚀 GENERATING MASTERCLASS EPISODE #{CURRENT_COUNT}", flush=True)
 
 TOPICS = [
     "escaping the rat race and building wealth",
@@ -139,25 +142,27 @@ TOPICS = [
 chosen_topic = random.choice(TOPICS)
 
 full_script = ""
-total_chapters = 8
+total_chapters = 6  # Optimized for stable CPU runtime (approx 15-20 mins)
 
-print("📝 Writing Script locally with Llama 3.2...")
+print(f"📝 Writing Script locally with {OLLAMA_MODEL}...", flush=True)
 
 for chapter_num in range(1, total_chapters + 1):
-    print(f"✍️ Gen Chapter {chapter_num}/{total_chapters}...")
+    print(f"✍️ Gen Chapter {chapter_num}/{total_chapters}...", flush=True)
     chapter_prompt = (
         f"You are writing a YouTube finance documentary about {chosen_topic}. "
         f"Write ONLY Chapter {chapter_num}. Make it highly detailed. "
         f"Write at least 3 long paragraphs. No bullet points or special characters."
     )
-    full_script += request_llm(chapter_prompt) + " "
+    text = request_llm(chapter_prompt)
+    print(f"✅ Chapter {chapter_num} generated.", flush=True)
+    full_script += text + " "
 
 raw_script = full_script.replace('"', '').replace('\n', ' ')
 sentences = re.split(r'(?<=[.!?]) +', raw_script)
 sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
 TOTAL_SCENES = len(sentences)
 
-print(f"🎬 Total Cuts to Render: {TOTAL_SCENES}")
+print(f"🎬 Total Cuts to Render: {TOTAL_SCENES}", flush=True)
 
 srt_content = ""
 current_time = 0.0
@@ -203,13 +208,13 @@ for idx, sentence in enumerate(sentences):
     
     if os.path.exists(scene_video_path):
         concat_lines.append(f"file 'scenes/scene_{scene_id}.mp4'")
-        print(f"✅ Rendered Cut {idx+1}/{TOTAL_SCENES}")
+        print(f"✅ Rendered Cut {idx+1}/{TOTAL_SCENES}", flush=True)
 
 # ============================================================
 # STEP 2: FAST CONCATENATION & SUBTITLES (FFMPEG ONLY)
 # ============================================================
 
-print("\n🎞️ JOINING CLIPS (RAM-SAFE CONCATENATION)...")
+print("\n🎞️ JOINING CLIPS (RAM-SAFE CONCATENATION)...", flush=True)
 with open(concat_file_path, "w") as f:
     f.write("\n".join(concat_lines))
 
@@ -227,7 +232,7 @@ ffmpeg_concat_cmd = [
 ]
 subprocess.run(ffmpeg_concat_cmd, check=True)
 
-print("\n🔥 BURNING KINETIC SUBTITLES (FINAL PASS)...")
+print("\n🔥 BURNING KINETIC SUBTITLES (FINAL PASS)...", flush=True)
 final_video_path = os.path.join(OUTPUT_DIR, f"final_video_{CURRENT_COUNT}.mp4")
 
 ffmpeg_sub_cmd = [
@@ -239,4 +244,4 @@ ffmpeg_sub_cmd = [
 ]
 subprocess.run(ffmpeg_sub_cmd, check=True)
 
-print(f"\n✅ FULL 30-MIN MASTERCLASS #{CURRENT_COUNT} CREATED SAFELY!")
+print(f"\n✅ FULL MASTERCLASS #{CURRENT_COUNT} CREATED SAFELY!", flush=True)
