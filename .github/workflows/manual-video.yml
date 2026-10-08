@@ -1,4 +1,4 @@
-name: 30-Min Masterclass Production (Zero-Error Engine)
+name: 30-Min Masterclass Production (Zero-RAM Crash)
 
 on:
   schedule:
@@ -22,35 +22,32 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install System Dependencies & FFmpeg
+      - name: Install System Dependencies (FFmpeg & Espeak)
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core wget tar
+          sudo apt-get install -y ffmpeg fonts-dejavu-core espeak-ng wget
           ffmpeg -version
 
-      - name: Setup Piper TTS (Local Neural Voice)
+      - name: Download Kokoro ONNX Model
         run: |
           set -e
-          wget -q https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz
-          tar -xzf piper_amd64.tar.gz
-          mkdir -p models
-          wget -q -O models/voice.onnx https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/bryce/medium/en_US-bryce-medium.onnx
-          wget -q -O models/voice.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/bryce/medium/en_US-bryce-medium.onnx.json
+          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model/kokoro-v0_19.onnx
+          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model/voices.json
 
-      - name: Setup Ollama (Local AI Scriptwriter)
+      - name: Setup Ollama (Llama 3.2 for Long Scripts)
         run: |
           set -e
           curl -fsSL https://ollama.com/install.sh | sh
           ollama serve > /tmp/ollama.log 2>&1 &
           sleep 10
-          ollama pull qwen2.5:3b
+          ollama pull llama3.2
 
-      - name: Install Python Libraries (Fixed Pillow Version)
+      - name: Install Python Libraries
         run: |
           set -e
           python -m pip install --upgrade pip
-          pip install requests "moviepy==1.0.3" "Pillow==9.5.0"
+          pip install requests "Pillow==9.5.0" kokoro-onnx soundfile
 
       - name: Execute Core Video Pipeline
         env:
