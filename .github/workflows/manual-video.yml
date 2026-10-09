@@ -34,9 +34,23 @@ jobs:
           git clone --recursive https://github.com/leejet/stable-diffusion.cpp
           cd stable-diffusion.cpp
           mkdir build && cd build
-          cmake .. && cmake --build . --config Release
-          cp bin/sd ../../sd
+          cmake .. 
+          # Sirf main 'sd' target build karenge, time bachega
+          cmake --build . --config Release --target sd
+          
+          # Smart Copy Logic: Jahan bhi file ho wahan se utha lo
+          if [ -f "bin/sd" ]; then
+            cp bin/sd ../../sd
+          elif [ -f "sd" ]; then
+            cp sd ../../sd
+          else
+            echo "Error: SD binary not found anywhere!"
+            exit 1
+          fi
+          
           cd ../../
+          chmod +x sd
+          
           echo "Downloading High-Quality Dreamshaper v8..."
           wget -q https://huggingface.co/Lykon/DreamShaper/resolve/main/DreamShaper_8_pruned.safetensors -O model.safetensors
 
