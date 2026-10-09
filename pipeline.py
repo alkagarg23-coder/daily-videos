@@ -121,6 +121,6 @@ if thumb_img:
         draw = ImageDraw.Draw(final_thumb)
         draw.text((50, 280), "STOP", fill=(239, 68, 68), font=font1)
         draw.text((50, 390), "DOING THIS", fill=(250, 204, 21), font=font1)
-        draw.text((50, 500), "FINANCE SECRETS", fill=(255, 255, 255), font=font2) # Episode hٹا दिया
+        draw.text((50, 500), "FINANCE SECRETS", fill=(255, 255, 255), font=font2)
         final_thumb.save("output/thumbnail.jpg", format="JPEG", quality=100)
     except: pass
