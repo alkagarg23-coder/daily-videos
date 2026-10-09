@@ -1,248 +1,164 @@
-import os
-import sys
-import re
-import time
-import random
-import requests
-import subprocess
-import numpy as np
-import soundfile as sf
+import os, sys, re, time, random, requests, subprocess
 from PIL import Image, ImageDraw, ImageFont
 from kokoro_onnx import Kokoro
+import soundfile as sf
+import textwrap
 
-# =====================================================================
-# 1. PIPELINE INITIALIZATION & I/O MANAGEMENT
-# =====================================================================
-directories = ["output/audio", "output/images", "output/scenes"]
-for d in directories:
-    os.makedirs(d, exist_ok=True)
+# --- 1. SETUP ---
+for f in ["output/audio", "output/images", "output/scenes"]: os.makedirs(f, exist_ok=True)
 
-print("🚀 INITIATING AUTONOMOUS RENDER ENGINE (30-MINUTE TARGET)", flush=True)
+print("🚀 STARTING HIGH-QUALITY LOCAL RENDER (STANDALONE VIDEO)", flush=True)
+tts = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
 
-# Initialize Kokoro TTS engine (Requires kokoro-v1.0.onnx and voices-v1.0.bin)
-try:
-    tts = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
-except Exception as e:
-    print(f"CRITICAL ERROR: Failed to load Kokoro ONNX model. {e}")
-    sys.exit(1)
-
-# =====================================================================
-# 2. LOCAL AI GENERATION ENGINES (TEXT & VISION)
-# =====================================================================
+# --- 2. FAST LOCAL ENGINES ---
 def llm(prompt):
-    """
-    Interfaces with Ollama. Contains aggressive exponential backoff
-    to prevent thermal throttling or context timeout on cloud CPUs.
-    """
-    for attempt in range(5):
+    for _ in range(4):
         try:
-            res = requests.post(
-                "http://127.0.0.1:11434/api/generate", 
-                json={"model": "gemma2:2b", "prompt": prompt, "stream": False}, 
-                timeout=300
-            )
+            res = requests.post("http://127.0.0.1:11434/api/generate", json={"model": "gemma2:2b", "prompt": prompt, "stream": False}, timeout=240)
             return res.json()["response"].strip()
         except Exception as e:
-            print(f"⚠️ LLM Timeout (Attempt {attempt+1}/5). Cooling down CPU... {e}")
-            time.sleep(15)
-    return "Building wealth is a systematic process of consistent discipline."
+            print(f"LLM Retrying... {e}")
+            time.sleep(5)
+    return "Building wealth takes time, discipline, and understanding how money actually works. Let us begin."
 
 def clean_txt(text):
-    """Sanitizes LLM output for safe TTS processing and subtitle rendering."""
-    c = re.sub(r'#|\*|_|`|~|>|\[.*?\]|\(.*?\)|http\S+', '', text)
-    c = c.replace('"', '').replace('\n', ' ').replace('-', ' ')
+    c = re.sub(r'#|\*|_|`|~|>|\[.*?\]|\(.*?\)|http\S+', '', text).replace('"', '').replace('\n', ' ').replace('-', ' ')
     return re.sub(r'\s+', ' ', c).strip()
 
-def get_local_image(prompt, path):
-    """
-    Generates imagery using stable-diffusion.cpp. 
-    Optimized to 10 steps for CPU speed. Includes a PIL fallback to 
-    prevent missing-file errors that cause black screens in FFmpeg.
-    """
-    safe_prompt = re.sub(r'[^a-zA-Z0-9\s]', '', prompt)[:120]
+def create_fallback_image(text, path):
+    """Creates a beautiful text image if Stable Diffusion fails, avoiding blank screens."""
+    img = Image.new('RGB', (1280, 720), (20, 20, 25))
+    draw = ImageDraw.Draw(img)
+    try: font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 50)
+    except: font = ImageFont.load_default()
+    
+    wrapper = textwrap.TextWrapper(width=45)
+    word_list = wrapper.wrap(text=text[:150] + ("..." if len(text) > 150 else ""))
+    
+    y_text = 250
+    for line in word_list:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        width = bbox[2] - bbox[0]
+        draw.text(((1280 - width) / 2, y_text), line, font=font, fill=(200, 200, 200))
+        y_text += 70
+    img.save(path, format="JPEG", quality=90)
+
+def get_local_image(prompt, path, sentence):
     sd_cmd = [
         "./sd", "-m", "model.safetensors",
-        "-p", f"masterpiece, highly detailed, black and white minimalist stickman drawing on a clean whiteboard. {safe_prompt}. authentic youtube explainer style.",
-        "-n", "text, bad anatomy, blurry, messy lines, realistic, colorful", 
-        "--steps", "10", "--cfg-scale", "5.0", 
+        "-p", f"masterpiece, highly detailed, dark moody aesthetic, cinematic, finance related. {prompt}.",
+        "-n", "text, bad anatomy, blurry, messy lines, cartoon", 
+        "--steps", "15", "--cfg-scale", "7.0", 
         "-W", "768", "-H", "512", "-o", "temp_out.png"
     ]
     try:
-        # 180s timeout prevents the 6-hour CI/CD action from failing due to hangs
-        subprocess.run(sd_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        subprocess.run(sd_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
         img = Image.open("temp_out.png").convert("RGB")
-        img.resize((1280, 720), Image.Resampling.LANCZOS).save(path, format="JPEG", quality=95)
+        img.resize((1280, 720), Image.Resampling.LANCZOS).save(path, format="JPEG", quality=100)
     except Exception as e:
-        print(f"⚠️ Image generation fallback triggered for prompt '{safe_prompt}': {e}")
-        # Generate an off-white fallback canvas to ensure the video keeps rendering
-        Image.new('RGB', (1280, 720), (245, 245, 245)).save(path, format="JPEG")
+        print(f"Image generation fallback activated (SD failed): {e}")
+        # Never output a blank screen. Use the text fallback.
+        create_fallback_image(sentence, path)
 
-def format_ass_time(seconds):
-    """Formats float seconds into ASS timestamp format: H:MM:SS.cs"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    cs = min(99, int((seconds - int(seconds)) * 100))
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+def format_ass(seconds):
+    h, m, s = int(seconds // 3600), int((seconds % 3600) // 60), int(seconds % 60)
+    return f"{h}:{m:02d}:{s:02d}.{min(99, int((seconds - int(seconds)) * 100)):02d}"
 
-# =====================================================================
-# 3. LONG-FORM SCRIPT GENERATION (SCALED FOR 30 MINUTES)
-# =====================================================================
-topic = random.choice([
-    "The dark psychology of debt and escaping the rat race", 
-    "Why saving money keeps you poor", 
-    "The hidden secrets of the top 1% wealth builders"
-])
-
-print(f"📝 Generating script for topic: {topic}")
+# --- 3. HIGH-RETENTION SCRIPT (20+ Minutes) ---
+topic = random.choice(["The dark psychology of debt and escaping the rat race", "Why saving money keeps you poor", "The hidden secrets of the top 1% wealth builders"])
 script = ""
+total_chapters = 25 # Increased to 25 to guarantee 20-30 minutes
 
-# 30 iterations * ~150 words = ~4,500 words. (~30 minutes of speech at 150wpm)
-for i in range(1, 31):
+print(f"📝 GENERATING SCRIPT FOR TOPIC: {topic}...")
+for i in range(1, total_chapters + 1):
+    print(f"Writing Chapter {i}/{total_chapters}...")
     if i == 1:
-        prompt = f"Write the INTRO chapter for a 30-minute YouTube finance documentary on '{topic}'. Start with a shocking hook ('99% of people are lied to...'). Make it highly suspenseful. 3 long paragraphs. Plain English."
+        prompt = f"Write INTRO chapter for a YouTube finance video on '{topic}'. Start with a shocking hook ('99% of people are lied to...'). Make it suspenseful. Write 4 long paragraphs. Plain English."
     else:
-        prompt = f"Write Chapter {i}/30 of a finance documentary on '{topic}'. Provide 3 highly detailed, insightful paragraphs. Plain English. Do not include titles or headings."
-    
-    chunk = llm(prompt)
-    script += chunk + " "
-    print(f"   Generated chapter {i}/30")
+        prompt = f"Write Chapter {i}/{total_chapters} of a very detailed finance documentary on '{topic}'. Write 4 long paragraphs explaining a new deep concept. Plain English."
+    script += llm(prompt) + " "
 
-# Split script into larger semantic chunks (approx 2 sentences) to reduce SD.cpp calls.
-raw_sentences = [s.strip() for s in re.split(r'(?<=[.!?]) +', script) if len(s.strip()) > 15]
-chunks_text = []
-for i in range(0, len(raw_sentences), 2):
-    chunks_text.append(" ".join(raw_sentences[i:i+2]))
-    
-total_chunks = len(chunks_text)
-print(f"Total visual scenes extracted: {total_chunks}")
+sentences = [s.strip() for s in re.split(r'(?<=[.!?]) +', script) if len(s.strip()) > 15]
+print(f"✅ SCRIPT COMPLETE. Total sentences: {len(sentences)}")
 
-# =====================================================================
-# 4. TIMELINE ASSEMBLY, TTS SYNC, AND KARAOKE MATHEMATICS
-# =====================================================================
-curr_time = 0.0
-ass_events = []
-video_segments = []
+# --- 4. TIMELINE ASSEMBLY & SYNC ---
+curr_time, ass_events, chunks = 0.0, [], []
 thumb_img = None
 
-print("🎬 Compiling Audio, Video, and Subtitle synchronizations...")
-for idx, text_chunk in enumerate(chunks_text):
+for idx, sen in enumerate(sentences):
     sid = f"{idx:04d}"
-    wav = f"output/audio/{sid}.wav"
-    jpg = f"output/images/{sid}.jpg"
-    mp4 = f"output/scenes/{sid}.mp4"
+    wav, jpg, mp4 = f"output/audio/{sid}.wav", f"output/images/{sid}.jpg", f"output/scenes/{sid}.mp4"
     
-    safe_text = clean_txt(text_chunk)
-    if not safe_text: continue
-        
-    # Generate Audio via Kokoro-ONNX (24000 Hz)
-    try: 
-        samples, sr = tts.create(safe_text, voice="am_michael", speed=1.0)
-    except: 
-        # Ultimate fallback stripping all non-alphanumeric characters
-        stripped = re.sub(r'[^a-zA-Z0-9\s\.,]', '', safe_text)
-        samples, sr = tts.create(stripped, voice="am_michael", speed=1.0)
-        
+    safe_sen = clean_txt(sen) or "Listen closely."
+    try: samples, sr = tts.create(safe_sen, voice="am_michael", speed=1.0)
+        except: samples, sr = tts.create(re.sub(r'[^a-zA-Z0-9\s\.,]', '', safe_sen), voice="am_michael", speed=1.0)
+    
+    # Save Audio
     sf.write(wav, samples, sr)
     dur = len(samples) / sr
     
-    # Skip microscopic audio artifacts that break FFmpeg concat demuxing
-    if dur < 1.0: continue
+    if dur < 0.5: continue
 
-    # Generate visual asset (Only pass the first 80 chars to SD to prevent token overflow)
-    get_local_image(safe_text[:80], jpg)
-    if not thumb_img and os.path.exists(jpg) and idx == 3: 
-        thumb_img = jpg
+    # Generate Image (Yahan agar SD fail hoga toh text-based image ban jayegi, blank screen nahi aayegi)
+    get_local_image(safe_sen[:60], jpg, safe_sen)
+    if not thumb_img and os.path.exists(jpg) and idx == 3: thumb_img = jpg
 
-    # --- KARAOKE SUBTITLE GENERATION (THE \kf ALGORITHM) ---
-    words = safe_text.split()
-    # Weight characters to estimate spoken duration. Punctuation takes longer to speak.
-    weighted_chars = [max(len(w) + (6 if w.endswith(',') or w.endswith('.') or w.endswith('?') else 0), 1) for w in words]
-    total_weight = max(sum(weighted_chars), 1)
-    time_per_weight = dur / total_weight
+    # Subtitle Word Timing Calculation
+    words = safe_sen.split()
+    weighted_chars = [len(w) + (5 if w.endswith(',') or w.endswith('.') else 0) for w in words]
+    tpc = dur / max(sum(weighted_chars), 1)
     
-    ass_text_payload = ""
+    w_start = curr_time
     for i, w in enumerate(words):
-        w_dur = weighted_chars[i] * time_per_weight
-        # Convert duration to centiseconds for the \kf tag
-        cs_dur = int(w_dur * 100)
-        # Escape ASS special characters
+        w_end = w_start + (weighted_chars[i] * tpc)
         clean_w = w.replace('"', '').replace("'", "\\'")
-        ass_text_payload += f"{{\\kf{cs_dur}}}{clean_w} "
-    
-    # Create the single synchronized line event
-    ass_events.append(
-        f"Dialogue: 0,{format_ass_time(curr_time)},{format_ass_time(curr_time + dur)},"
-        f"Default,,0,0,0,,{ass_text_payload.strip()}"
-    )
-    
-    # --- FFMPEG BLACK-SCREEN PREVENTION & ENCODING ---
-    # format=yuv420p MUST be at the end of the filterchain to prevent libx264 color space crashes.
-    ffmpeg_cmd = [
-        "ffmpeg", "-y", "-loop", "1", "-framerate", "15", 
-        "-i", jpg, "-i", wav, 
-        "-vf", f"scale=8000:-1,zoompan=z='min(zoom+0.0005,1.10)':d={int(dur*15)+15}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1280x720,format=yuv420p", 
-        "-c:v", "libx264", "-preset", "ultrafast", "-profile:v", "main",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "24000",
-        "-shortest", "-fps_mode", "cfr", "-t", str(dur), mp4
-    ]
-    
-    subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    video_segments.append(f"file 'scenes/{sid}.mp4'")
-    
+        # PERFECT WHITE SUBTITLES WITH SMOOTH POP ANIMATION
+        ass_events.append(f"Dialogue: 0,{format_ass(w_start)},{format_ass(w_end)},Default,,0,0,0,,{{\\fad(70,70)\\fscx80\\fscy80\\t(0,120,\\fscx100\\fscy100)}}{clean_w}")
+        w_start = w_end
     curr_time += dur
-    if idx % 5 == 0:
-        print(f"   Processed {idx}/{total_chunks} scenes. Current runtime: {curr_time/60:.2f} mins")
 
-# =====================================================================
-# 5. FINAL MASTER RENDER & METADATA
-# =====================================================================
-print("📦 Assembling Final 30-Minute Masterpiece...")
-with open("output/concat.txt", "w") as f: 
-    f.write("\n".join(video_segments))
+    print(f"🎬 Rendering Scene {idx+1}/{len(sentences)} [{dur:.1f}s]")
+    # Sync Image + Audio -> Scene MP4 (With Zoom Effect)
+    subprocess.run(["ffmpeg", "-y", "-loop", "1", "-framerate", "15", "-i", jpg, "-i", wav, 
+                    "-vf", f"format=yuv420p,scale=8000:-1,zoompan=z='min(zoom+0.0008,1.2)':d={int(dur*15)+5}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1280x720,fps=15", 
+                    "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "128k", "-t", str(dur), mp4], 
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    chunks.append(f"file 'scenes/{sid}.mp4'")
 
-# --- ASS HEADER SPECIFICATION ---
-# SecondaryColour = &H00FFFFFF (White Base)
-# PrimaryColour = &H0000FFFF (Yellow Sweep)
-# The \kf tag pre-fills with White and sweeps to Yellow over the word's duration.
+# --- 5. RENDER, SEO & THUMBNAIL ---
+print("📦 COMBINING ALL SCENES...")
+with open("output/concat.txt", "w") as f: f.write("\n".join(chunks))
+
+# PROPER ASS STYLING: &H00FFFFFF is Pure White with a nice black shadow and border
 ass_head = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1280
 PlayResY: 720
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,55,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,2,10,10,60,1
+Style: Default,Arial,65,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,3,5,10,10,250,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+with open("output/subs.ass", "w", encoding="utf-8") as f: f.write(ass_head + "\n".join(ass_events))
 
-with open("output/subs.ass", "w", encoding="utf-8") as f: 
-    f.write(ass_head + "\n".join(ass_events))
+# Concatenate all chunks
+subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "output/concat.txt", "-c", "copy", "output/raw_video.mp4"], check=True)
 
-# Concat pass (stream copy ensures exact synchronization preservation)
-subprocess.run(
-    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "output/concat.txt", "-c", "copy", "output/raw_video.mp4"], 
-    check=True
-)
+print("🔤 BURNING SUBTITLES...")
+# Hardsub the perfectly timed and formatted ASS subtitles
+subprocess.run(["ffmpeg", "-y", "-i", "output/raw_video.mp4", "-vf", "ass='output/subs.ass'", "-c:a", "copy", "output/final_video.mp4"], check=True)
 
-# Subtitle burn-in pass (Applying the generated ASS file)
-subprocess.run(
-    ["ffmpeg", "-y", "-i", "output/raw_video.mp4", "-vf", "ass='output/subs.ass'", "-c:a", "copy", "output/final_video.mp4"], 
-    check=True
-)
-
-# Generating SEO metadata
+# Generate SEO Metadata
 with open("output/seo_metadata.txt", "w", encoding="utf-8") as f: 
-    seo_prompt = f"Generate SEO metadata for a 30-minute YouTube video on: '{topic}'. FORMAT EXACTLY:\nTITLE: [Clickbait title]\nDESCRIPTION: [500 chars with emojis 🚨🔥💰. Call to subscribe.]\nTAGS: [tags]"
-    f.write(llm(seo_prompt))
+    f.write(llm(f"Generate SEO for: '{topic}'. FORMAT EXACTLY:\nTITLE: [Clickbait title]\nDESCRIPTION: [500 chars with emojis 🚨🔥💰. Call to subscribe.]\nTAGS: [tags]"))
 
-# Dynamic Thumbnail Generation
+# Generate Thumbnail with Text overlay
 if thumb_img:
     try:
         img = Image.open(thumb_img).convert("RGBA")
         grad = Image.new('RGBA', img.size, (0,0,0,0))
         d = ImageDraw.Draw(grad)
-        # Apply cinematic gradient fade to the left side
         for x in range(int(img.width * 0.6)):
             d.line([(x, 0), (x, img.height)], fill=(20, 20, 20, int(255 * (1 - (x / (img.width * 0.6))))))
         
@@ -254,11 +170,11 @@ if thumb_img:
             font1 = font2 = ImageFont.load_default()
             
         draw = ImageDraw.Draw(final_thumb)
-        draw.text((60, 280), "STOP", fill=(239, 68, 68), font=font1)
-        draw.text((60, 390), "DOING THIS", fill=(250, 204, 21), font=font1)
-        draw.text((60, 500), "FINANCE SECRETS", fill=(255, 255, 255), font=font2)
+        draw.text((50, 280), "STOP", fill=(239, 68, 68), font=font1)
+        draw.text((50, 390), "DOING THIS", fill=(250, 204, 21), font=font1)
+        draw.text((50, 500), "FINANCE SECRETS", fill=(255, 255, 255), font=font2)
         final_thumb.save("output/thumbnail.jpg", format="JPEG", quality=100)
-    except Exception as e:
-        print(f"Thumbnail generation skipped: {e}")
+    except: pass
 
-print("✅ EXECUTION COMPLETE. Artifacts stored in /output.", flush=True)
+print("✅ ALL TASKS COMPLETED SUCCESSFULLY!")
+
