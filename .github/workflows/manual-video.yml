@@ -10,25 +10,12 @@ permissions:
 
 jobs:
   build-production-video:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360 # Explicitly set to the absolute maximum allowed by GitHub Actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # GitHub Action ki max limit
 
     steps:
       - name: Checkout Code Repository
         uses: actions/checkout@v4
-
-      - name: Maximize Runner Disk Space (Prevent ENOSPC Failure)
-        # Critical step: Purges pre-installed SDKs to reclaim ~20GB of disk space.
-        # This prevents the 30-minute video compilation from failing due to disk exhaustion.
-        run: |
-          set -e
-          echo "Purging unnecessary software to maximize disk space..."
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h
 
       - name: Initialize Python 3.11 Environment
         uses: actions/setup-python@v5
@@ -40,40 +27,42 @@ jobs:
           set -e
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-dejavu espeak-ng wget build-essential cmake
-
+          
       - name: Build Local SD Engine & Fetch Dreamshaper v8
         run: |
           set -e
           git clone --recursive https://github.com/leejet/stable-diffusion.cpp
           cd stable-diffusion.cpp
-          mkdir -p build && cd build
+          mkdir build && cd build
           
-          # Compile stable-diffusion.cpp optimized for CPU fallback
-          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake .. 
           cmake --build . --config Release
           
-          SD_BINARY=$(find . -type f -executable -name "sd" | head -n 1)
-          cp "$SD_BINARY" ../../sd
+          # FIXED: Properly locating and copying the built binary
+          SD_BINARY=$(find . -name "sd" -type f -executable | head -n 1)
+          if [ -z "$SD_BINARY" ]; then
+            # Fallback path if find fails
+            cp bin/sd ../../sd
+          else
+            cp "$SD_BINARY" ../../sd
+          fi
           
           cd ../../
           chmod +x sd
           
-          echo "Downloading DreamShaper V8..."
           wget -q https://huggingface.co/Lykon/DreamShaper/resolve/main/DreamShaper_8_pruned.safetensors -O model.safetensors
 
-      - name: Fetch Local TTS Models (Kokoro-ONNX)
+      - name: Fetch Local TTS Models (Kokoro)
         run: |
           set -e
-          echo "Fetching Kokoro models..."
-          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
-          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.onnx
+          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin
 
       - name: Install Python Libraries
         run: |
           set -e
           python -m pip install --upgrade pip
-          # Explicitly pinning numpy for soundfile and ONNX compatibility
-          pip install requests "Pillow==9.5.0" kokoro-onnx soundfile "numpy<2.0"
+          pip install requests "Pillow==10.0.0" kokoro-onnx soundfile
 
       - name: 🚀 EXECUTE 100% LOCAL PIPELINE
         run: |
@@ -81,12 +70,8 @@ jobs:
           
           echo "STARTING LOCAL AI SERVER (OLLAMA)"
           curl -fsSL https://ollama.com/install.sh | sh
-          
-          # Start Ollama in the background and ensure it is fully initialized
           ollama serve > /tmp/ollama.log 2>&1 &
           sleep 15
-          
-          # Pull Gemma2:2b (Ideal for high-context narrative generation on CPU)
           ollama pull gemma2:2b
           
           echo "IGNITING PYTHON ENTERPRISE ENGINE"
@@ -97,10 +82,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          # Generate localized timestamp tag for release management
           RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")
           gh release create "v${RELEASE_TAG}" \
             output/final_video.mp4 \
             output/seo_metadata.txt \
             output/thumbnail.jpg \
-            --title "Finance Masterclass (${RELEASE_TAG})" --notes "Fully autonomous 30-minute generation output." || echo "Release created."
+            --title "Finance Masterclass (${RELEASE_TAG})" || echo "Release created."
