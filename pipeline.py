@@ -73,10 +73,11 @@ PAN_ZOOM = 1.15
 WORDS_PER_GROUP = 4
 
 SD_PROMPT_PREFIX = (
-    "masterpiece, ultra-detailed black and white stickman illustration on a clean whiteboard. "
-    "professional youtube explainer animation style. "
+    "simple black and white stick figure drawing on a clean whiteboard, "
+    "thick black marker lines, flat 2d comic style, highly expressive stickman, "
+    "minimalist whiteboard explainer animation style. "
 )
-SD_NEGATIVE = "text, letters, watermark, blurry, deformed, messy lines"
+SD_NEGATIVE = "realistic, 3d, shading, colors, human hands, flesh, real skin, detailed background, text, letters, watermark, blurry, deformed, messy lines, creepy, abstract, spider"
 
 PUNCT_WEIGHT = ",.;:!?"
 POP_TAG = r"{\fscx70\fscy70\t(0,100,\fscx100\fscy100)}"
@@ -310,7 +311,7 @@ def generate_seo(topic, chapters):
         "You are a viral YouTube growth expert. "
         f"Video topic: {topic}. Chapters: {outline}.\n"
         "Write an ultra-clickbait YouTube title, a 500-character highly engaging description packed with emojis "
-        "(🚨🔥💰), and 20 viral tags. Reply in EXACTLY this format and nothing else:\n"
+        "(), and 20 viral tags. Reply in EXACTLY this format and nothing else:\n"
         "TITLE: <title, max 90 characters>\n"
         "DESCRIPTION: <description>\n"
         "TAGS: <20 tags separated by commas>"
@@ -324,7 +325,7 @@ def generate_seo(topic, chapters):
     title = title_match.group(1).strip() if title_match else ""
     title = re.sub(r"[*_#`\"]", "", title).strip()
     if len(title) < 10:
-        title = f"🚨 The Shocking Truth About {topic.title()} (Nobody Tells You This)"
+        title = f" The Shocking Truth About {topic.title()} (Nobody Tells You This)"
     title = title[:100]
 
     description = desc_match.group(1).strip() if desc_match else ""
@@ -332,14 +333,14 @@ def generate_seo(topic, chapters):
     description = re.sub(r"\s+", " ", description).strip()
     if len(description) < 80:
         description = (
-            f"🚨 Everything you were never taught about {topic}. 🔥 In this deep-dive documentary we expose how the "
+            f" Everything you were never taught about {topic}.  In this deep-dive documentary we expose how the "
             "system really works, the mistakes that quietly cost people years of progress, and the simple steps "
-            "you can start using today. 💰 Watch until the end for the final twist, and subscribe so you never "
+            "you can start using today.  Watch until the end for the final twist, and subscribe so you never "
             "miss the next one!"
         )
     if len(description) > 500:
         description = description[:500].rsplit(" ", 1)[0]
-    description += "\n\n⚠️ Educational content only. This is not financial advice."
+    description += "\n\n Educational content only. This is not financial advice."
 
     tags = []
     if tags_match:
