@@ -1,432 +1,897 @@
-import os
-import re
-import sys
+#!/usr/bin/env python3
+"""100% local finance documentary pipeline (Ollama + Kokoro ONNX + stable-diffusion.cpp + FFmpeg)."""
+
+import datetime
+import gc
 import json
-import time
-import shutil
+import os
+import random
+import re
 import subprocess
-import requests
+import sys
+import time
+from pathlib import Path
+
 import numpy as np
+import requests
 import soundfile as sf
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageStat
 
-# ==============================================================================
-# CONFIGURATION & CONSTANTS
-# ==============================================================================
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "gemma2:2b"
-SD_BINARY = "./sd"
-SD_MODEL = "model.safetensors"
-KOKORO_MODEL = "kokoro-v1.0.onnx"
-KOKORO_VOICES = "voices-v1.0.bin"
-VOICE_NAME = "af_sarah"
-TARGET_WIDTH = 1280
-TARGET_HEIGHT = 720
-OUTPUT_VIDEO = "final_video.mp4"
-THUMBNAIL_FILE = "thumbnail.jpg"
-SCRIPT_FILE = "script.txt"
-ASS_FILE = "subs.ass"
-CONCAT_FILE = "concat_list.txt"
+# --------------------------------------------------------------------------- #
+# Paths and configuration
+# --------------------------------------------------------------------------- #
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT / "work"
+OUT = ROOT / "output"
+IMG_DIR = WORK / "images"
+AUDIO_DIR = WORK / "audio"
+CHUNK_DIR = WORK / "chunks"
 
-# ==============================================================================
-# 1. AI SCRIPT GENERATION (OLLAMA gemma2:2b)
-# ==============================================================================
-def generate_script():
-    print("[1/6] Generating 8-Chapter AI Finance Documentary Script...")
-    prompt = (
-        "Write an exhaustive, high-retention 8-chapter finance documentary script. "
-        "Chapter 1 MUST start strictly with: '99% of people are lied to about money from the day they are born.' "
-        "Topics across 8 chapters: 1. The Matrix of Debt, 2. The Inflation Trap, 3. Velocity of Money, "
-        "4. Fractional Reserve Illusion, 5. Assets vs Liabilities, 6. Tax Avoidance Strategies, "
-        "7. Asymmetric Opportunities, 8. Escaping the Rat Race. "
-        "Format output strictly as JSON with key 'chapters', a list of 8 objects, each having: "
-        "'title' (string), 'narration' (lengthy detailed text, at least 4 paragraphs), and 'visual_context' (short visual prompt)."
-    )
+SD_BIN = ROOT / "sd"
+SD_MODEL = ROOT / "model.safetensors"
+KOKORO_MODEL = ROOT / "kokoro-v1.0.onnx"
+KOKORO_VOICES = ROOT / "voices-v1.0.bin"
 
-    chapters = []
-    try:
-        payload = {
-            "model": MODEL_NAME,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json"
-        }
-        res = requests.post(OLLAMA_URL, json=payload, timeout=240)
-        if res.status_code == 200:
-            parsed = json.loads(res.json().get("response", "{}"))
-            chapters = parsed.get("chapters", [])
-    except Exception as e:
-        print(f"[-] Ollama generation query error: {e}. Falling back to default architecture.")
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+OLLAMA_MODEL = "gemma2:2b"
 
-    # Resilient fallback ensuring strict compliance and exact 8-chapter viral structure
-    if len(chapters) < 8:
-        fallback_narratives = [
-            ("The Matrix of Debt", 
-             "99% of people are lied to about money from the day they are born. Society conditions you to work forty years for green paper that governments print out of thin air. You take loans for degrees that teach outdated skills, finance cars that depreciate the minute you drive them, and trap yourself in thirty-year mortgages. The debt cycle is not an accident. It is an engineered financial conveyor belt designed to keep you compliant and dependent on a monthly paycheck.",
-             "stickman trapped inside a giant financial cage made of dollar bills and chains"),
-            ("The Inflation Trap",
-             "Your savings account is quietly burning to ashes while you sleep. Inflation is not a natural economic phenomenon; it is an invisible tax on your productivity. When central banks expand the money supply, the price of goods rises, eroding purchasing power. If your money sits idle in cash earning fractional interest, you are losing five to ten percent of your wealth every single year to stealth devaluation.",
-             "stickman watching a bank vault melt away as numbers on an hourglass run out"),
-            ("Velocity of Money",
-             "Wealthy institutions do not hoard dead cash; they master the velocity of money. Money must move continuously through cash-flowing instruments. When capital flows through real estate, dividend-yielding entities, and profitable businesses, it compounds exponentially before taxes can touch it. Stagnant capital decays, but circulating capital creates perpetual financial momentum.",
-             "stickman directing high-speed flowing arrows of coins through complex gears"),
-            ("Fractional Reserve Illusion",
-             "Modern banking operates on a mathematical illusion known as fractional reserve banking. When you deposit ten thousand dollars into a bank, the institution retains only a fraction and lends out the rest nine times over. They create billions of digital credits backed by nothing but promissory notes. The moment you grasp that money is created from debt, the entire global economy reveals its hidden blueprint.",
-             "stickman inspecting a gigantic house of cards built on bank pillars"),
-            ("Assets vs Liabilities",
-             "The middle class buys liabilities thinking they are assets. A genuine asset puts capital into your pocket whether you wake up or stay in bed. A liability drains your account through maintenance, interest, and taxes. True freedom begins when your passive asset yield exceeds your survival overhead. Every single dollar you earn must be deployed as a tireless digital worker generating cash flow.",
-             "stickman balancing scales between income-producing factories and a draining house"),
-            ("Tax Avoidance Strategies",
-             "Taxes are the single largest lifetime expense for any worker, devouring forty to fifty percent of gross lifetime earnings. The legal tax code is not a penalty system; it is a roadmap of incentives designed to stimulate housing, production, and commerce. By restructuring earned income into corporate entities, accelerated depreciation, and capital gains, the elite legally drop their tax rate to near zero.",
-             "stickman navigating a transparent glass maze holding a shield against tax arrows"),
-            ("Asymmetric Opportunities",
-             "To escape systemic mediocrity, you must seek asymmetric bets where the downside is strictly capped at one unit but the upside is virtually unlimited. Traditional finance preaches diversification into mediocre index funds. Modern sovereignty demands high-conviction allocation into scalable digital assets, decentralized protocols, and proprietary skill sets that cannot be inflated away.",
-             "stickman launching a rocket from a whiteboard launching pad towards compounding stars"),
-            ("Escaping the Rat Race",
-             "True wealth is not measured in luxury watches or sports cars; it is measured strictly in freedom and autonomy over your time. When you own your cash flow, you own your calendar. Reject the manufactured consumer illusions. Build your fortress of assets, detach your income from physical hours, and reclaim sovereignty over your life.",
-             "stickman breaking golden handcuffs and walking into an open sunrise horizon")
-        ]
-        chapters = []
-        for title, text, context in fallback_narratives:
-            chapters.append({
-                "title": title,
-                "narration": text,
-                "visual_context": context
-            })
+CHAPTERS = 8
+CHAPTER_WORDS = int(os.environ.get("CHAPTER_WORDS", "600"))
+MAX_PARTS_PER_CHAPTER = int(os.environ.get("MAX_PARTS_PER_CHAPTER", "6"))
 
-    with open(SCRIPT_FILE, "w", encoding="utf-8") as f:
-        for idx, ch in enumerate(chapters, 1):
-            f.write(f"=== CHAPTER {idx}: {ch['title']} ===\n")
-            f.write(f"VISUAL: {ch['visual_context']}\n")
-            f.write(f"NARRATION: {ch['narration']}\n\n")
+VOICE = "am_michael"
+SPEED = 1.0
+SCENE_TARGET_SEC = 22.0
+SCENE_MIN_TAIL_SEC = 8.0
+MIN_SCENE_SEC = 0.5
+SENTENCE_PAD_SEC = 0.18
 
-    print(f"[+] Script saved to {SCRIPT_FILE} with {len(chapters)} chapters.")
-    return chapters
+SD_TIMEOUT = 350
+# Minutes (measured from pipeline start) after which no new images are generated.
+IMAGE_DEADLINE_MIN = int(os.environ.get("IMAGE_DEADLINE_MIN", "265"))
 
-# ==============================================================================
-# 2. TTS SYNTHESIS (KOKORO ONNX) WITH REGEX FALLBACK
-# ==============================================================================
-def init_tts():
-    try:
-        from kokoro_onnx import Kokoro
-        if os.path.exists(KOKORO_MODEL) and os.path.exists(KOKORO_VOICES):
-            return Kokoro(KOKORO_MODEL, KOKORO_VOICES)
-        print("[-] Kokoro ONNX files missing.")
-        return None
-    except Exception as e:
-        print(f"[-] Error loading Kokoro ONNX: {e}")
-        return None
+W, H = 1280, 720
+FPS = 15
 
-def synthesize_sentence_audio(kokoro, text, output_wav):
-    def run_inference(clean_str):
-        if kokoro:
-            samples, sr = kokoro.create(clean_str, voice=VOICE_NAME, speed=1.0, lang="en-us")
-            return samples, sr
-        return None, 24000
+SD_PROMPT_PREFIX = (
+    "masterpiece, ultra-detailed black and white stickman illustration on a clean whiteboard. "
+    "professional youtube explainer animation style. "
+)
+SD_NEGATIVE = "text, letters, watermark, blurry, deformed, messy lines"
 
-    try:
-        samples, sr = run_inference(text)
-    except Exception:
-        # Fallback to regex-cleaned text on crash
-        cleaned = re.sub(r'[^a-zA-Z0-9\s.,!?]', '', text)
+PUNCT_WEIGHT = ",.;:!?"
+POP_TAG = r"{\fscx70\fscy70\t(0,100,\fscx100\fscy100)}"
+
+START = time.time()
+
+TOPICS = [
+    "how inflation silently destroys your savings",
+    "why most people never build real wealth",
+    "how credit cards and debt keep people trapped",
+    "the truth about index funds and compound interest",
+    "how banks really make money from your money",
+    "the psychology of money and spending habits",
+    "how hidden fees and taxes drain your retirement",
+    "why the middle class keeps falling behind",
+    "the biggest money mistakes people make in their twenties and thirties",
+    "how the wealthy actually think about money",
+]
+
+DEFAULT_TITLES = [
+    "The Truth They Hide From You",
+    "The Hidden Problem",
+    "How The System Really Works",
+    "The Biggest Mistakes People Make",
+    "What The Wealthy Do Differently",
+    "The Math That Changes Everything",
+    "Your Step By Step Action Plan",
+    "The Final Truth",
+]
+
+STYLE_RULES = (
+    "You are a world-class YouTube finance documentary scriptwriter. "
+    "Write ONLY the spoken narration as plain flowing paragraphs. "
+    "No headings, no bullet points, no markdown, no emojis, no stage directions, no speaker labels, "
+    "and never write the word 'Chapter'. Mix short punchy sentences with longer ones and speak directly to "
+    "the viewer using 'you'. Do not invent precise statistics or cite made-up studies, and do not give "
+    "personalized investment advice. Keep it educational."
+)
+
+OUTRO_TEXT = (
+    "If this changed the way you think about money, subscribe and watch the next video. "
+    "Everything in this video is for educational purposes only and is not financial advice."
+)
+
+
+def log(message):
+    print(f"[{(time.time() - START) / 60.0:7.1f} min] {message}", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# Ollama helpers
+# --------------------------------------------------------------------------- #
+def llm(prompt, num_predict=450, temperature=0.8, retries=3):
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": "30m",
+        "options": {
+            "temperature": temperature,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
+            "num_predict": num_predict,
+            "num_ctx": 4096,
+        },
+    }
+    for attempt in range(1, retries + 1):
         try:
-            samples, sr = run_inference(cleaned)
+            response = requests.post(OLLAMA_URL, json=payload, timeout=1500)
+            response.raise_for_status()
+            text = response.json().get("response", "").strip()
+            if text:
+                return text
+            log(f"LLM returned empty text (attempt {attempt})")
+        except Exception as exc:
+            log(f"LLM request failed (attempt {attempt}): {exc}")
+        time.sleep(5)
+    return ""
+
+
+def unload_llm():
+    try:
+        requests.post(
+            OLLAMA_URL,
+            json={"model": OLLAMA_MODEL, "prompt": "", "keep_alive": 0, "stream": False},
+            timeout=60,
+        )
+        log("Ollama model unloaded to free RAM")
+    except Exception as exc:
+        log(f"Could not unload Ollama model: {exc}")
+
+
+def word_count(text):
+    return len(text.split())
+
+
+def _dollars(match):
+    number = match.group(1).rstrip(".,")
+    unit = match.group(2)
+    return f"{number} {unit} dollars" if unit else f"{number} dollars"
+
+
+def clean_narration(text):
+    text = text.replace("\r", "")
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    kept = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r"^[-*_=#\s]{3,}$", line):
+            continue
+        if re.match(r"^(okay|ok|sure|certainly|here is|here's|here are)\b.*[:!]$", line, re.I):
+            continue
+        line = re.sub(r"^\s*(?:[-\u2022*]|\d+[.)])\s+", "", line)
+        line = re.sub(r"^(chapter|narrator|voiceover|voice over|scene)\b[^:]{0,70}:\s*", "", line, flags=re.I)
+        kept.append(line)
+    text = " ".join(kept)
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    replacements = {
+        "\u2019": "'",
+        "\u2018": "'",
+        "\u201c": "",
+        "\u201d": "",
+        "\u2026": "...",
+        "\u2014": ", ",
+        "\u2013": ", ",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = re.sub(r"[*_#`>~|\"]", "", text)
+    text = re.sub(
+        r"\$\s?(\d[\d,.]*)\s*(thousand|million|billion|trillion)?",
+        _dollars,
+        text,
+        flags=re.I,
+    )
+    text = text.replace("%", " percent").replace("&", " and ")
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# Stage 1: script + SEO
+# --------------------------------------------------------------------------- #
+def get_chapter_titles(topic):
+    prompt = (
+        f"List exactly {CHAPTERS} short chapter titles (maximum 6 words each) for a 30-minute YouTube "
+        f"finance documentary about: {topic}. Output only the {CHAPTERS} titles, one per line, numbered."
+    )
+    raw = llm(prompt, num_predict=200, temperature=0.7)
+    titles = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        line = re.sub(r"^\s*(?:[-\u2022*]|\d+[.):])\s*", "", line)
+        line = re.sub(r"[*_#`\"]", "", line)
+        line = re.sub(r"^(chapter|part)\s*\d+\s*[:\-]?\s*", "", line, flags=re.I).strip()
+        if 3 <= len(line) <= 70 and not line.endswith(":"):
+            titles.append(line)
+    if len(titles) < CHAPTERS:
+        titles = titles + DEFAULT_TITLES[len(titles):]
+    return titles[:CHAPTERS]
+
+
+def generate_chapter(topic, titles, index):
+    title = titles[index]
+    parts = []
+    for part in range(MAX_PARTS_PER_CHAPTER):
+        if part == 0 and index == 0:
+            prompt = (
+                f"{STYLE_RULES}\n\n"
+                f"Write the OPENING HOOK of a 30-minute YouTube documentary about: {topic}.\n"
+                "Make it extremely viral, controversial and suspenseful. Open with a shocking claim in the spirit of "
+                "'99 percent of people are being lied to about money', then build tension with open loops: tease the "
+                "secrets the viewer is about to discover and promise a big reveal later in the video. "
+                "Use short punchy sentences and speak directly to 'you'. About 220 words. Output only the narration."
+            )
+        elif part == 0:
+            prompt = (
+                f"{STYLE_RULES}\n\n"
+                f"Write the narration for part {index + 1} of {CHAPTERS} of a documentary about: {topic}. "
+                f"This part is titled '{title}'. Start with a strong curiosity hook, then explain the idea with "
+                "vivid everyday examples and simple analogies. About 220 words. Output only the narration."
+            )
+        else:
+            tail = " ".join(" ".join(parts).split()[-120:])
+            prompt = (
+                f"{STYLE_RULES}\n\n"
+                f"Documentary topic: {topic}. Current part: '{title}'.\n"
+                f"Narration so far (end of it): {tail}\n\n"
+                "Continue the narration smoothly with about 220 NEW words. Do not repeat earlier points, "
+                "do not summarize, and do not conclude the video. Output only the new narration."
+            )
+        text = clean_narration(llm(prompt))
+        if word_count(text) < 20:
+            log(f"Chapter {index + 1} part {part + 1} was too short, skipping")
+            continue
+        parts.append(text)
+        total_words = word_count(" ".join(parts))
+        log(f"Chapter {index + 1}/{CHAPTERS} part {part + 1}: {total_words} words so far")
+        if total_words >= CHAPTER_WORDS:
+            break
+    chapter_text = " ".join(parts)
+    if index == CHAPTERS - 1:
+        chapter_text = (chapter_text + " " + OUTRO_TEXT).strip()
+    return chapter_text
+
+
+def generate_script():
+    topic = TOPICS[datetime.date.today().toordinal() % len(TOPICS)]
+    log(f"Topic: {topic}")
+    titles = get_chapter_titles(topic)
+    log("Chapter titles: " + " | ".join(titles))
+    chapters = []
+    for index in range(CHAPTERS):
+        text = generate_chapter(topic, titles, index)
+        chapters.append({"title": titles[index], "text": text})
+    total_words = sum(word_count(c["text"]) for c in chapters)
+    log(f"Script complete: {total_words} words")
+    if total_words < 300:
+        raise RuntimeError("LLM produced too little script text; aborting.")
+    (WORK / "script.json").write_text(json.dumps({"topic": topic, "chapters": chapters}, indent=2), encoding="utf-8")
+    return topic, chapters
+
+
+def generate_seo(topic, chapters):
+    outline = "; ".join(c["title"] for c in chapters)
+    prompt = (
+        "You are a viral YouTube growth expert. "
+        f"Video topic: {topic}. Chapters: {outline}.\n"
+        "Write an ultra-clickbait YouTube title, a 500-character highly engaging description packed with emojis "
+        "(🚨🔥💰), and 20 viral tags. Reply in EXACTLY this format and nothing else:\n"
+        "TITLE: <title, max 90 characters>\n"
+        "DESCRIPTION: <description>\n"
+        "TAGS: <20 tags separated by commas>"
+    )
+    raw = llm(prompt, num_predict=500, temperature=0.9)
+
+    title_match = re.search(r"TITLE:\s*(.+)", raw)
+    desc_match = re.search(r"DESCRIPTION:\s*(.+?)(?=\n\s*TAGS:|\Z)", raw, re.S)
+    tags_match = re.search(r"TAGS:\s*(.+)", raw, re.S)
+
+    title = title_match.group(1).strip() if title_match else ""
+    title = re.sub(r"[*_#`\"]", "", title).strip()
+    if len(title) < 10:
+        title = f"🚨 The Shocking Truth About {topic.title()} (Nobody Tells You This)"
+    title = title[:100]
+
+    description = desc_match.group(1).strip() if desc_match else ""
+    description = re.sub(r"[*_#`]", "", description)
+    description = re.sub(r"\s+", " ", description).strip()
+    if len(description) < 80:
+        description = (
+            f"🚨 Everything you were never taught about {topic}. 🔥 In this deep-dive documentary we expose how the "
+            "system really works, the mistakes that quietly cost people years of progress, and the simple steps "
+            "you can start using today. 💰 Watch until the end for the final twist, and subscribe so you never "
+            "miss the next one!"
+        )
+    if len(description) > 500:
+        description = description[:500].rsplit(" ", 1)[0]
+    description += "\n\n⚠️ Educational content only. This is not financial advice."
+
+    tags = []
+    if tags_match:
+        for tag in re.split(r"[,\n]", tags_match.group(1)):
+            tag = re.sub(r"[#*_`\"]", "", tag).strip()
+            if 2 <= len(tag) <= 40 and tag.lower() not in [t.lower() for t in tags]:
+                tags.append(tag)
+    fallback_tags = [
+        "finance", "money", "investing", "personal finance", "wealth", "financial freedom", "saving money",
+        "budgeting", "passive income", "stock market", "inflation", "debt", "retirement", "banking",
+        "money mistakes", "financial education", "compound interest", "index funds", "credit score",
+        "money tips",
+    ]
+    for tag in fallback_tags:
+        if len(tags) >= 20:
+            break
+        if tag.lower() not in [t.lower() for t in tags]:
+            tags.append(tag)
+    tags = tags[:20]
+    while len(", ".join(tags)) > 480 and len(tags) > 5:
+        tags.pop()
+
+    payload = f"TITLE:\n{title}\n\nDESCRIPTION:\n{description}\n\nTAGS:\n{', '.join(tags)}\n"
+    (OUT / "seo_metadata.txt").write_text(payload, encoding="utf-8")
+    log("SEO metadata saved")
+
+
+# --------------------------------------------------------------------------- #
+# Stage 2: TTS
+# --------------------------------------------------------------------------- #
+def split_long(sentence, limit=220):
+    if len(sentence) <= limit:
+        return [sentence]
+    pieces, current = [], ""
+    for chunk in re.split(r"(?<=[,;:])\s+", sentence):
+        if current and len(current) + len(chunk) + 1 > limit:
+            pieces.append(current.strip())
+            current = chunk
+        else:
+            current = f"{current} {chunk}".strip()
+    if current:
+        pieces.append(current.strip())
+    final = []
+    for piece in pieces:
+        while len(piece) > limit * 1.5:
+            cut = piece.rfind(" ", 0, limit)
+            if cut <= 0:
+                cut = limit
+            final.append(piece[:cut].strip())
+            piece = piece[cut:].strip()
+        if piece:
+            final.append(piece)
+    return final
+
+
+def split_sentences(text):
+    sentences = []
+    for raw in re.split(r"(?<=[.!?])\s+", text):
+        raw = raw.strip()
+        if not raw:
+            continue
+        for piece in split_long(raw):
+            if re.search(r"[A-Za-z0-9]", piece):
+                sentences.append(piece)
+    return sentences
+
+
+def synth(tts, text):
+    try:
+        samples, sample_rate = tts.create(text, voice=VOICE, speed=SPEED, lang="en-us")
+        return np.asarray(samples, dtype=np.float32).flatten(), int(sample_rate)
+    except Exception as exc:
+        log(f"TTS failed on sentence ({exc}); retrying with cleaned text")
+    cleaned = re.sub(r"[^A-Za-z0-9\s.,!?'\-]", " ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not re.search(r"[A-Za-z0-9]", cleaned):
+        return None
+    try:
+        samples, sample_rate = tts.create(cleaned, voice=VOICE, speed=SPEED, lang="en-us")
+        return np.asarray(samples, dtype=np.float32).flatten(), int(sample_rate)
+    except Exception as exc:
+        log(f"TTS fallback also failed, skipping sentence: {exc}")
+        return None
+
+
+def build_scenes(chapters):
+    from kokoro_onnx import Kokoro
+
+    tts = Kokoro(str(KOKORO_MODEL), str(KOKORO_VOICES))
+    scenes = []
+    sample_rate = None
+
+    for chapter_index, chapter in enumerate(chapters):
+        items = []
+        for sentence in split_sentences(chapter["text"]):
+            result = synth(tts, sentence)
+            if result is None:
+                continue
+            samples, sr = result
+            if sample_rate is None:
+                sample_rate = sr
+            if sr != sample_rate or samples.size < int(0.2 * sr):
+                continue
+            padded = np.concatenate([samples, np.zeros(int(sr * SENTENCE_PAD_SEC), dtype=np.float32)])
+            items.append({"text": sentence, "samples": padded, "dur": len(padded) / float(sr)})
+
+        groups, current, current_dur = [], [], 0.0
+        for item in items:
+            current.append(item)
+            current_dur += item["dur"]
+            if current_dur >= SCENE_TARGET_SEC:
+                groups.append(current)
+                current, current_dur = [], 0.0
+        if current:
+            if groups and current_dur < SCENE_MIN_TAIL_SEC:
+                groups[-1].extend(current)
+            else:
+                groups.append(current)
+
+        for group in groups:
+            audio = np.concatenate([g["samples"] for g in group])
+            duration = len(audio) / float(sample_rate)
+            if duration < MIN_SCENE_SEC:
+                continue
+            scene_index = len(scenes)
+            wav_path = AUDIO_DIR / f"scene_{scene_index:03d}.wav"
+            sf.write(str(wav_path), audio, sample_rate, subtype="PCM_16")
+            sentences, offset = [], 0.0
+            for g in group:
+                sentences.append({"text": g["text"], "start": offset, "dur": g["dur"]})
+                offset += g["dur"]
+            scenes.append(
+                {
+                    "index": scene_index,
+                    "chapter": chapter_index,
+                    "title": chapter["title"],
+                    "text": " ".join(g["text"] for g in group),
+                    "wav": wav_path,
+                    "duration": duration,
+                    "sentences": sentences,
+                }
+            )
+        log(f"TTS chapter {chapter_index + 1}/{CHAPTERS} done, scenes so far: {len(scenes)}")
+        del items, groups
+        gc.collect()
+
+    del tts
+    gc.collect()
+    total = sum(s["duration"] for s in scenes)
+    log(f"TTS complete: {len(scenes)} scenes, {total / 60.0:.1f} minutes of audio")
+    if not scenes:
+        raise RuntimeError("No audio scenes were generated.")
+    return scenes
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3: images
+# --------------------------------------------------------------------------- #
+def load_font(size, bold=True):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+    ]
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size)
         except Exception:
-            samples = None
-            sr = 24000
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
 
-    if samples is None or len(samples) == 0:
-        # Fallback to local espeak-ng if onnx fails
-        clean_espeak = re.sub(r'[^a-zA-Z0-9\s.,!?]', '', text)
-        cmd = ["espeak-ng", "-w", output_wav, "-v", "en-us", "-s", "160", clean_espeak]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if os.path.exists(output_wav):
-            data, sr = sf.read(output_wav)
-            duration = len(data) / float(sr)
-            return duration
-        return 0.0
 
-    duration = len(samples) / float(sr)
-    if duration < 0.5:
-        # Skip audio chunks < 0.5s as per requirement
-        return 0.0
+def image_is_valid(path):
+    try:
+        img = Image.open(path).convert("RGB").resize((64, 64))
+        stat = ImageStat.Stat(img)
+        mean = sum(stat.mean) / 3.0
+        std = sum(stat.stddev) / 3.0
+        return mean > 20 and std > 4
+    except Exception:
+        return False
 
-    sf.write(output_wav, samples, sr)
-    return duration
 
-# ==============================================================================
-# 3. LOCAL IMAGE GENERATION (SD.CPP) & PIL RESIZING
-# ==============================================================================
-def create_fallback_canvas(target_path, context_text):
-    img = Image.new("RGB", (TARGET_WIDTH, TARGET_HEIGHT), color=(250, 250, 250))
+def to_video_frame(img):
+    img = img.convert("RGB")
+    width, height = img.size
+    scale = max(W / width, H / height)
+    resized = img.resize((round(width * scale), round(height * scale)), Image.Resampling.LANCZOS)
+    left = (resized.width - W) // 2
+    top = (resized.height - H) // 2
+    return resized.crop((left, top, left + W, top + H))
+
+
+def make_fallback_image(title, path):
+    img = Image.new("RGB", (W, H), (250, 250, 250))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([20, 20, TARGET_WIDTH - 20, TARGET_HEIGHT - 20], outline=(40, 40, 40), width=6)
-    draw.ellipse([600, 200, 680, 280], outline=(20, 20, 20), width=5)
-    draw.line([640, 280, 640, 440], fill=(20, 20, 20), width=5)
-    draw.line([640, 320, 560, 380], fill=(20, 20, 20), width=5)
-    draw.line([640, 320, 720, 280], fill=(20, 20, 20), width=5)
-    draw.line([640, 440, 580, 560], fill=(20, 20, 20), width=5)
-    draw.line([640, 440, 700, 560], fill=(20, 20, 20), width=5)
-    draw.text((50, TARGET_HEIGHT - 80), context_text[:70], fill=(100, 100, 100))
-    img.save(target_path, "JPEG", quality=95)
+    for x in range(0, W, 80):
+        draw.line([(x, 0), (x, H)], fill=(236, 236, 236), width=2)
+    for y in range(0, H, 80):
+        draw.line([(0, y), (W, y)], fill=(236, 236, 236), width=2)
+    ink = (25, 25, 25)
+    cx, cy = 640, 300
+    draw.ellipse((cx - 45, cy - 150, cx + 45, cy - 60), outline=ink, width=8)
+    draw.line((cx, cy - 60, cx, cy + 80), fill=ink, width=8)
+    draw.line((cx, cy - 30, cx - 90, cy + 35), fill=ink, width=8)
+    draw.line((cx, cy - 30, cx + 90, cy - 90), fill=ink, width=8)
+    draw.line((cx, cy + 80, cx - 60, cy + 190), fill=ink, width=8)
+    draw.line((cx, cy + 80, cx + 60, cy + 190), fill=ink, width=8)
+    draw.ellipse((cx + 95, cy - 160, cx + 175, cy - 80), outline=ink, width=8)
+    draw.text((cx + 135, cy - 120), "$", font=load_font(48), fill=ink, anchor="mm")
+    font = load_font(54)
+    words, lines, line = title.split(), [], ""
+    for word in words:
+        trial = f"{line} {word}".strip()
+        if draw.textbbox((0, 0), trial, font=font)[2] > W - 160 and line:
+            lines.append(line)
+            line = word
+        else:
+            line = trial
+    if line:
+        lines.append(line)
+    y = 530
+    for text_line in lines[:2]:
+        draw.text((W // 2, y), text_line, font=font, fill=ink, anchor="mm")
+        y += 70
+    img.save(path, "JPEG", quality=92)
 
-def generate_image_sd(context, output_jpg):
-    prompt = f"masterpiece, ultra-detailed stickman illustration on a whiteboard. professional explainer style. {context}"
-    negative_prompt = "text, letters, watermark, blurry"
-    raw_png = output_jpg.replace(".jpg", ".png")
 
-    if os.path.exists(SD_BINARY) and os.path.exists(SD_MODEL):
+def scene_context(scene):
+    first_sentence = scene["sentences"][0]["text"] if scene["sentences"] else scene["text"]
+    first_words = " ".join(first_sentence.split()[:14])
+    context = f"{scene['title']}, {first_words}"
+    context = re.sub(r"[^A-Za-z0-9, ]", " ", context)
+    return re.sub(r"\s+", " ", context).strip()
+
+
+def generate_scene_image(prompt, index, base_seed):
+    raw_path = IMG_DIR / f"raw_{index:03d}.png"
+    for attempt in range(2):
+        if raw_path.exists():
+            raw_path.unlink()
+        seed = base_seed + attempt * 7919
         cmd = [
-            SD_BINARY,
-            "-m", SD_MODEL,
+            str(SD_BIN),
+            "-m", str(SD_MODEL),
             "-p", prompt,
-            "-n", negative_prompt,
+            "-n", SD_NEGATIVE,
             "--steps", "15",
             "--cfg-scale", "7.0",
             "-W", "768",
             "-H", "512",
-            "-o", raw_png
+            "-t", "2",
+            "-s", str(seed),
+            "--vae-tiling",
+            "-o", str(raw_path),
         ]
         try:
-            print(f"[SD.CPP] Generating frame for: '{context[:35]}...'")
-            subprocess.run(cmd, timeout=350, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if os.path.exists(raw_png):
-                with Image.open(raw_png) as im:
-                    im_resized = im.resize((TARGET_WIDTH, TARGET_HEIGHT), resample=Image.Resampling.LANCZOS)
-                    im_resized.convert("RGB").save(output_jpg, "JPEG", quality=95)
-                os.remove(raw_png)
-                return
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=350, cwd=str(ROOT))
         except subprocess.TimeoutExpired:
-            print(f"[!] Subprocess timeout (350s) exceeded on SD.CPP. Falling back to clean canvas.")
-        except Exception as e:
-            print(f"[!] SD.CPP execution failed ({e}). Falling back to clean canvas.")
+            log(f"Image {index}: sd timed out after {SD_TIMEOUT}s")
+            return None, "timeout"
+        if result.returncode == 0 and raw_path.exists() and image_is_valid(raw_path):
+            return raw_path, "ok"
+        tail = (result.stderr or result.stdout or "")[-300:].replace("\n", " ")
+        log(f"Image {index}: attempt {attempt + 1} failed or came out black (rc={result.returncode}) {tail}")
+    return None, "failed"
 
-    create_fallback_canvas(output_jpg, context)
 
-# ==============================================================================
-# 4. PUNCTUATION-AWARE SUBTITLE SYNC (ASS GENERATOR)
-# ==============================================================================
-def format_ass_time(seconds):
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    centis = int(round((seconds - int(seconds)) * 100))
-    if centis >= 100:
-        centis = 99
+def build_images(scenes):
+    deadline = START + IMAGE_DEADLINE_MIN * 60
+    image_times = []
+    credit = 0.0
+    last_good = None
+    reuse_count = 0
+    generated = set()
+
+    for i, scene in enumerate(scenes):
+        out_path = IMG_DIR / f"scene_{i:03d}.jpg"
+        remaining_scenes = len(scenes) - i
+        time_left = deadline - time.time()
+        generate = False
+
+        if not image_times:
+            generate = time_left > SD_TIMEOUT
+        else:
+            avg = sum(image_times) / len(image_times)
+            if time_left > avg * 1.1:
+                ratio = min(1.0, time_left / (avg * remaining_scenes))
+                credit += ratio
+                if credit >= 1.0:
+                    generate = True
+                    credit -= 1.0
+
+        done = False
+        if generate:
+            prompt = SD_PROMPT_PREFIX + scene_context(scene)
+            started = time.time()
+            raw_path, status = generate_scene_image(prompt, i, random.randint(1, 2**31 - 1))
+            elapsed = time.time() - started
+            image_times.append(SD_TIMEOUT if status == "timeout" else elapsed)
+            if raw_path is not None:
+                to_video_frame(Image.open(raw_path)).save(out_path, "JPEG", quality=92)
+                last_good = out_path
+                generated.add(i)
+                done = True
+                log(f"Image {i + 1}/{len(scenes)} generated in {elapsed:.0f}s")
+            try:
+                raw = IMG_DIR / f"raw_{i:03d}.png"
+                if raw.exists():
+                    raw.unlink()
+            except Exception:
+                pass
+
+        if not done:
+            if last_good is not None:
+                frame = Image.open(last_good).convert("RGB")
+                reuse_count += 1
+                if reuse_count % 2 == 1:
+                    frame = frame.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                frame.save(out_path, "JPEG", quality=92)
+            else:
+                make_fallback_image(scene["title"], out_path)
+        scene["image"] = out_path
+        scene["generated"] = i in generated
+
+    log(f"Images ready: {len(generated)} generated, {len(scenes) - len(generated)} reused or fallback")
+    return scenes
+
+
+# --------------------------------------------------------------------------- #
+# Stage 4: subtitles (punctuation-aware sync)
+# --------------------------------------------------------------------------- #
+ASS_HEADER = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,65,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,4,1,2,60,60,50,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+
+def ass_time(seconds):
+    cs = max(0, int(round(seconds * 100)))
+    hours = cs // 360000
+    minutes = (cs // 6000) % 60
+    secs = (cs // 100) % 60
+    centis = cs % 100
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
-class ASSSubtitleGenerator:
-    def __init__(self, filename):
-        self.filename = filename
-        self.events = []
 
-    def add_sentence_words(self, sentence, start_time, duration):
-        words = sentence.strip().split()
-        if not words or duration <= 0:
-            return
+def escape_ass(text):
+    return text.replace("\\", "").replace("{", "").replace("}", "").replace("\n", " ")
 
-        weights = []
-        for w in words:
-            weight = len(w)
-            if w.endswith(",") or w.endswith("."):
-                weight += 5
-            weights.append(weight)
 
-        total_weight = sum(weights)
-        if total_weight == 0:
-            total_weight = len(words)
-            weights = [1] * len(words)
+def sentence_events(text, t0, t1):
+    words = text.split()
+    if not words or t1 - t0 < 0.05:
+        return []
+    weights = [len(word) + (5 if word[-1] in PUNCT_WEIGHT else 0) for word in words]
+    bounds = [0.0]
+    for weight in weights:
+        bounds.append(bounds[-1] + weight)
+    total = float(bounds[-1])
 
-        current_time = start_time
-        for w, weight in zip(words, weights):
-            w_duration = (weight / float(total_weight)) * duration
-            w_start = current_time
-            w_end = current_time + w_duration
-            current_time = w_end
+    groups, current = [], []
+    for position, word in enumerate(words):
+        current.append(position)
+        if len(current) >= 3 or word[-1] in PUNCT_WEIGHT:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
 
-            clean_w = w.replace("\\", "")
-            pop_effect = r"{\fscx70\fscy70\t(0,100,\fscx100\fscy100)}"
-            text_field = f"{pop_effect}{clean_w}"
-            self.events.append((w_start, w_end, text_field))
+    duration = t1 - t0
+    events = []
+    for group in groups:
+        start = t0 + duration * bounds[group[0]] / total
+        end = t0 + duration * bounds[group[-1] + 1] / total
+        if end - start < 0.03:
+            continue
+        phrase = escape_ass(" ".join(words[p] for p in group))
+        events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Default,,0,0,0,,{POP_TAG}{phrase}")
+    return events
 
-    def write_file(self):
-        header = (
-            "[Script Info]\n"
-            "Title: Finance Documentary\n"
-            "ScriptType: v4.00+\n"
-            "WrapStyle: 0\n"
-            "ScaledBorderAndShadow: yes\n"
-            "PlayResX: 1280\n"
-            "PlayResY: 720\n\n"
-            "[V4+ Styles]\n"
-            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
-            "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            "Style: Default,Arial,65,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
-            "-1,0,0,0,100,100,0,0,1,4,2,2,30,30,80,1\n\n"
-            "[Events]\n"
-            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-        )
-        with open(self.filename, "w", encoding="utf-8") as f:
-            f.write(header)
-            for start, end, text in self.events:
-                f.write(f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},Default,,0,0,0,,{text}\n")
 
-# ==============================================================================
-# 5. HIGH-RETENTION THUMBNAIL GENERATOR (PIL)
-# ==============================================================================
-def generate_thumbnail(base_image_path):
-    print("[5/6] Generating High-Retention Thumbnail...")
-    if not os.path.exists(base_image_path):
-        create_fallback_canvas(base_image_path, "Financial Secret Blueprint")
+def build_ass(scenes):
+    lines = [ASS_HEADER.rstrip("\n")]
+    for scene in scenes:
+        scale = scene["timeline_dur"] / scene["duration"]
+        scene_end = scene["timeline_start"] + scene["timeline_dur"]
+        for sentence in scene["sentences"]:
+            t0 = scene["timeline_start"] + sentence["start"] * scale
+            t1 = min(t0 + sentence["dur"] * scale, scene_end)
+            lines.extend(sentence_events(sentence["text"], t0, t1))
+    (WORK / "subs.ass").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log("subs.ass written")
 
-    with Image.open(base_image_path) as base_im:
-        img = base_im.resize((TARGET_WIDTH, TARGET_HEIGHT), resample=Image.Resampling.LANCZOS).convert("RGBA")
 
-    # Black transparent gradient on the left 60%
-    overlay = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), (0, 0, 0, 0))
-    gradient_limit = int(TARGET_WIDTH * 0.60)
-    for x in range(gradient_limit):
-        ratio = 1.0 - (x / float(gradient_limit))
-        alpha = int(240 * ratio)
-        line = Image.new("RGBA", (1, TARGET_HEIGHT), (0, 0, 0, alpha))
-        overlay.paste(line, (x, 0))
-
-    img = Image.alpha_composite(img, overlay)
-    draw = ImageDraw.Draw(img)
-
-    # Font Locator
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    if not os.path.exists(font_path):
-        font_path = "DejaVuSans-Bold.ttf"
-
+# --------------------------------------------------------------------------- #
+# Stage 5: FFmpeg assembly
+# --------------------------------------------------------------------------- #
+def probe_duration(path):
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        ],
+        capture_output=True,
+        text=True,
+    )
     try:
-        font_large = ImageFont.truetype(font_path, 105)
-        font_medium = ImageFont.truetype(font_path, 80)
+        return float(result.stdout.strip())
     except Exception:
-        font_large = ImageFont.load_default()
-        font_medium = ImageFont.load_default()
+        return 0.0
 
-    def draw_bordered_text(draw_ctx, pos, text, font, fill_color, stroke_color, stroke_w=6):
-        x, y = pos
-        for dx in range(-stroke_w, stroke_w + 1):
-            for dy in range(-stroke_w, stroke_w + 1):
-                if dx * dx + dy * dy <= stroke_w * stroke_w:
-                    draw_ctx.text((x + dx, y + dy), text, font=font, fill=stroke_color)
-        draw_ctx.text((x, y), text, font=font, fill=fill_color)
 
-    # Required Thumbnail Text Layout
-    draw_bordered_text(draw, (70, 120), "STOP", font_large, (255, 30, 30), (0, 0, 0), stroke_w=8)
-    draw_bordered_text(draw, (70, 250), "DOING THIS", font_large, (255, 215, 0), (0, 0, 0), stroke_w=8)
-    draw_bordered_text(draw, (70, 420), "FINANCE SECRETS", font_medium, (255, 255, 255), (0, 0, 0), stroke_w=6)
+def assemble(scenes):
+    valid = []
+    cursor = 0.0
+    for scene in scenes:
+        chunk = CHUNK_DIR / f"chunk_{scene['index']:03d}.mp4"
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-loop", "1", "-framerate", "15", "-i", str(scene["image"]),
+            "-i", str(scene["wav"]),
+            "-vf", "scale=1280:720,format=yuv420p",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest", str(chunk),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        actual = probe_duration(chunk) if chunk.exists() else 0.0
+        if result.returncode != 0 or actual < MIN_SCENE_SEC:
+            log(f"Chunk {scene['index']} failed, dropping scene: {(result.stderr or '')[-200:]}")
+            continue
+        scene["chunk"] = chunk
+        scene["timeline_start"] = cursor
+        scene["timeline_dur"] = actual
+        cursor += actual
+        valid.append(scene)
+        if scene["index"] % 10 == 0:
+            log(f"Chunk {scene['index'] + 1}/{len(scenes)} encoded")
 
-    img.convert("RGB").save(THUMBNAIL_FILE, "JPEG", quality=95)
-    print(f"[+] Thumbnail saved to {THUMBNAIL_FILE}")
+    if not valid:
+        raise RuntimeError("No video chunks could be encoded.")
 
-# ==============================================================================
-# 6. PIPELINE ORCHESTRATION & FFMPEG RENDERING
-# ==============================================================================
+    concat_file = WORK / "concat.txt"
+    concat_file.write_text(
+        "".join(f"file '{scene['chunk'].resolve()}'\n" for scene in valid),
+        encoding="utf-8",
+    )
+    merged = WORK / "merged.mp4"
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_file),
+            "-c", "copy", str(merged),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not merged.exists():
+        raise RuntimeError(f"Concat failed: {result.stderr[-500:]}")
+    log(f"Concatenated {len(valid)} chunks, total {cursor / 60.0:.1f} minutes")
+
+    build_ass(valid)
+
+    final_path = OUT / "final_video.mp4"
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", "merged.mp4",
+            "-vf", "ass=subs.ass",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-pix_fmt", "yuv420p",
+            "-c:a", "copy", "-movflags", "+faststart",
+            str(final_path),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(WORK),
+    )
+    if result.returncode != 0 or not final_path.exists():
+        raise RuntimeError(f"Subtitle burn-in failed: {result.stderr[-500:]}")
+    size_mb = final_path.stat().st_size / (1024 * 1024)
+    log(f"Final video written: {size_mb:.0f} MB")
+    return valid
+
+
+# --------------------------------------------------------------------------- #
+# Stage 6: thumbnail
+# --------------------------------------------------------------------------- #
+def make_thumbnail(scenes):
+    source = None
+    if len(scenes) > 2 and scenes[2].get("generated"):
+        source = scenes[2]["image"]
+    else:
+        for scene in scenes:
+            if scene.get("generated"):
+                source = scene["image"]
+                break
+        if source is None:
+            source = scenes[min(2, len(scenes) - 1)]["image"]
+
+    base = Image.open(source).convert("RGB").resize((W, H), Image.Resampling.LANCZOS).convert("RGBA")
+
+    grad_w = int(W * 0.6)
+    ramp = np.linspace(215, 0, grad_w).astype(np.uint8)
+    alpha = np.zeros((H, W), dtype=np.uint8)
+    alpha[:, :grad_w] = ramp[None, :]
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    overlay.putalpha(Image.fromarray(alpha))
+    composed = Image.alpha_composite(base, overlay)
+
+    draw = ImageDraw.Draw(composed)
+    big = load_font(95)
+    small = load_font(65)
+    draw.text((50, 280), "STOP", font=big, fill="#EF4444", stroke_width=5, stroke_fill="black")
+    draw.text((50, 390), "DOING THIS", font=big, fill="#FACC15", stroke_width=5, stroke_fill="black")
+    draw.text((50, 500), "FINANCE SECRETS", font=small, fill="#FFFFFF", stroke_width=4, stroke_fill="black")
+
+    composed.convert("RGB").save(OUT / "thumbnail.jpg", "JPEG", quality=92, optimize=True)
+    log("Thumbnail saved")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def check_prerequisites():
+    missing = [p.name for p in (SD_BIN, SD_MODEL, KOKORO_MODEL, KOKORO_VOICES) if not p.exists()]
+    if missing:
+        raise RuntimeError(f"Missing required files: {', '.join(missing)}")
+
+
 def main():
-    print("=== STARTING AUTONOMOUS DOCUMENTARY PIPELINE ===")
-    chapters = generate_script()
-    kokoro = init_tts()
-    ass_gen = ASSSubtitleGenerator(ASS_FILE)
+    for directory in (WORK, OUT, IMG_DIR, AUDIO_DIR, CHUNK_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+    check_prerequisites()
 
-    chunk_files = []
-    global_timeline = 0.0
-    chunk_index = 0
+    log("Stage 1/6: script and SEO")
+    topic, chapters = generate_script()
+    generate_seo(topic, chapters)
+    unload_llm()
+    gc.collect()
 
-    os.makedirs("chunks", exist_ok=True)
+    log("Stage 2/6: text to speech")
+    scenes = build_scenes(chapters)
 
-    for ch_idx, ch in enumerate(chapters):
-        narration = ch["narration"]
-        visual_ctx = ch["visual_context"]
-        sentences = re.split(r'(?<=[.!?])\s+', narration.strip())
+    log("Stage 3/6: image generation")
+    scenes = build_images(scenes)
 
-        for s_idx, sentence in enumerate(sentences):
-            sentence = sentence.strip()
-            if not sentence:
-                continue
+    log("Stage 4-5/6: FFmpeg assembly and subtitles")
+    scenes = assemble(scenes)
 
-            audio_file = f"chunks/audio_{chunk_index}.wav"
-            image_file = f"chunks/image_{chunk_index}.jpg"
-            chunk_mp4 = f"chunks/chunk_{chunk_index}.mp4"
+    log("Stage 6/6: thumbnail")
+    make_thumbnail(scenes)
 
-            # TTS Generation
-            duration = synthesize_sentence_audio(kokoro, sentence, audio_file)
-            if duration < 0.5:
-                continue
+    log("Pipeline finished successfully")
 
-            # Subtitle Sync
-            ass_gen.add_sentence_words(sentence, global_timeline, duration)
-            global_timeline += duration
-
-            # Image Generation
-            generate_image_sd(visual_ctx, image_file)
-
-            # Frame-Locked Video Chunk Rendering
-            cmd_chunk = [
-                "ffmpeg", "-y",
-                "-loop", "1",
-                "-framerate", "15",
-                "-i", image_file,
-                "-i", audio_file,
-                "-vf", "scale=1280:720,format=yuv420p",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-shortest",
-                chunk_mp4
-            ]
-            subprocess.run(cmd_chunk, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            chunk_files.append(chunk_mp4)
-            chunk_index += 1
-
-    ass_gen.write_file()
-    print(f"[+] Synced {chunk_index} chunks. Total runtime: {global_timeline / 60.0:.2f} mins.")
-
-    # Concat Chunks
-    with open(CONCAT_FILE, "w", encoding="utf-8") as f:
-        for cf in chunk_files:
-            f.write(f"file '{cf}'\n")
-
-    raw_concat = "full_video_raw.mp4"
-    print("[4/6] Concatenating frame-locked chunks...")
-    cmd_concat = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", CONCAT_FILE,
-        "-c", "copy",
-        raw_concat
-    ]
-    subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-    # Burn ASS Subtitles
-    print("[5/6] Burning kinetic ASS subtitles...")
-    cmd_burn = [
-        "ffmpeg", "-y",
-        "-i", raw_concat,
-        "-vf", f"ass={ASS_FILE}",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-c:a", "copy",
-        OUTPUT_VIDEO
-    ]
-    subprocess.run(cmd_burn, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-    # Thumbnail Generation from chunk index 2 (or index 0 fallback)
-    selected_thumb_bg = "chunks/image_2.jpg" if os.path.exists("chunks/image_2.jpg") else "chunks/image_0.jpg"
-    generate_thumbnail(selected_thumb_bg)
-
-    # Cleanup intermediate files
-    for temp in [raw_concat, CONCAT_FILE, ASS_FILE]:
-        if os.path.exists(temp):
-            os.remove(temp)
-    shutil.rmtree("chunks", ignore_errors=True)
-
-    print(f"[6/6] Pipeline Execution Finished Successfully. Output: {OUTPUT_VIDEO}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        log(f"FATAL: {error}")
+        sys.exit(1)
