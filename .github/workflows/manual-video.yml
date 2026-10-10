@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Short test run (tiny script, few images, published as pre-release)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -61,17 +66,25 @@ jobs:
           chmod +x sd
           ls -lh sd
 
+      - name: Show sd options (debug)
+        run: |
+          ./sd --help 2>&1 | head -n 120 || true
+
       - name: Download AI models
         run: |
           set -eu
           wget -nv --tries=5 --retry-connrefused --waitretry=5 \
             "https://huggingface.co/Lykon/DreamShaper/resolve/main/DreamShaper_8_pruned.safetensors"
           mv DreamShaper_8_pruned.safetensors model.safetensors
+          mkdir -p loras
+          wget -nv --tries=5 --retry-connrefused --waitretry=5 \
+            -O loras/lcm-lora-sdv1.5.safetensors \
+            "https://huggingface.co/latent-consistency/lcm-lora-sdv1-5/resolve/main/pytorch_lora_weights.safetensors"
           wget -nv --tries=5 --retry-connrefused --waitretry=5 \
             "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
           wget -nv --tries=5 --retry-connrefused --waitretry=5 \
             "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
-          ls -lh model.safetensors kokoro-v1.0.onnx voices-v1.0.bin
+          ls -lh model.safetensors loras/lcm-lora-sdv1.5.safetensors kokoro-v1.0.onnx voices-v1.0.bin
 
       - name: Install and start Ollama
         run: |
@@ -88,12 +101,21 @@ jobs:
           ollama pull gemma2:2b
 
       - name: Run video pipeline
+        env:
+          CHAPTER_WORDS: ${{ inputs.test_mode && '60' || '600' }}
+          MAX_PARTS_PER_CHAPTER: ${{ inputs.test_mode && '1' || '6' }}
+          IMAGE_DEADLINE_MIN: ${{ inputs.test_mode && '20' || '230' }}
         run: python -u pipeline.py
 
       - name: Create GitHub release
         run: |
           set -eu
           RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")
+          EXTRA=""
+          if [ "${{ inputs.test_mode }}" = "true" ]; then
+            EXTRA="--prerelease"
+          fi
           gh release create "v${RELEASE_TAG}" output/final_video.mp4 output/seo_metadata.txt output/thumbnail.jpg \
             --title "Finance Masterclass (${RELEASE_TAG})" \
-            --notes "Automatically generated finance documentary. See seo_metadata.txt for the title, description and tags."
+            --notes "Automatically generated finance documentary. See seo_metadata.txt for the title, description and tags." \
+            $EXTRA
