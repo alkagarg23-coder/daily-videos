@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import requests
 import soundfile as sf
-from PIL import Image, ImageDraw, ImageFont, ImageStat
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
 
 # --------------------------------------------------------------------------- #
 # Paths and configuration
@@ -31,6 +31,8 @@ SD_BIN = ROOT / "sd"
 SD_MODEL = ROOT / "model.safetensors"
 KOKORO_MODEL = ROOT / "kokoro-v1.0.onnx"
 KOKORO_VOICES = ROOT / "voices-v1.0.bin"
+LORA_DIR = ROOT / "loras"
+LORA_NAME = "lcm-lora-sdv1.5"
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_MODEL = "gemma2:2b"
@@ -41,17 +43,34 @@ MAX_PARTS_PER_CHAPTER = int(os.environ.get("MAX_PARTS_PER_CHAPTER", "6"))
 
 VOICE = "am_michael"
 SPEED = 1.0
-SCENE_TARGET_SEC = 22.0
-SCENE_MIN_TAIL_SEC = 8.0
+SCENE_TARGET_SEC = 10.0
+SCENE_MIN_TAIL_SEC = 6.0
 MIN_SCENE_SEC = 0.5
 SENTENCE_PAD_SEC = 0.18
+SILENCE_THRESHOLD = 0.01
+SILENCE_KEEP_SEC = 0.04
 
 SD_TIMEOUT = 350
+# Keep SD sizes multiples of 64 (576x320 is close to 16:9 and safe for SD 1.5).
+SD_WIDTH = int(os.environ.get("SD_WIDTH", "576"))
+SD_HEIGHT = int(os.environ.get("SD_HEIGHT", "320"))
+SD_STEPS = os.environ.get("SD_STEPS", "5")
+SD_CFG = os.environ.get("SD_CFG", "1.5")
 # Minutes (measured from pipeline start) after which no new images are generated.
-IMAGE_DEADLINE_MIN = int(os.environ.get("IMAGE_DEADLINE_MIN", "265"))
+IMAGE_DEADLINE_MIN = int(os.environ.get("IMAGE_DEADLINE_MIN", "230"))
 
 W, H = 1280, 720
+# Scene images are stored at 2x the video size so zoompan can move without visible jitter.
+SRC_W, SRC_H = W * 2, H * 2
 FPS = 15
+
+# Fade at the start and end of every scene (seconds).
+FADE_SEC = 0.25
+# Total zoom gained in a zoom scene, and the fixed zoom used while panning.
+ZOOM_RANGE = 0.18
+PAN_ZOOM = 1.15
+# Number of words shown together in each subtitle group.
+WORDS_PER_GROUP = 4
 
 SD_PROMPT_PREFIX = (
     "masterpiece, ultra-detailed black and white stickman illustration on a clean whiteboard. "
@@ -406,6 +425,17 @@ def synth(tts, text):
         return None
 
 
+def trim_silence(samples, sr):
+    """Cut leading/trailing silence so subtitle word timing is spread over real speech only."""
+    loud = np.where(np.abs(samples) > SILENCE_THRESHOLD)[0]
+    if loud.size == 0:
+        return samples
+    keep = int(SILENCE_KEEP_SEC * sr)
+    start = max(int(loud[0]) - keep, 0)
+    end = min(int(loud[-1]) + keep, len(samples))
+    return samples[start:end]
+
+
 def build_scenes(chapters):
     from kokoro_onnx import Kokoro
 
@@ -424,8 +454,18 @@ def build_scenes(chapters):
                 sample_rate = sr
             if sr != sample_rate or samples.size < int(0.2 * sr):
                 continue
+            samples = trim_silence(samples, sr)
+            if samples.size < int(0.2 * sr):
+                continue
             padded = np.concatenate([samples, np.zeros(int(sr * SENTENCE_PAD_SEC), dtype=np.float32)])
-            items.append({"text": sentence, "samples": padded, "dur": len(padded) / float(sr)})
+            items.append(
+                {
+                    "text": sentence,
+                    "samples": padded,
+                    "dur": len(padded) / float(sr),
+                    "speech": len(samples) / float(sr),
+                }
+            )
 
         groups, current, current_dur = [], [], 0.0
         for item in items:
@@ -450,7 +490,7 @@ def build_scenes(chapters):
             sf.write(str(wav_path), audio, sample_rate, subtype="PCM_16")
             sentences, offset = [], 0.0
             for g in group:
-                sentences.append({"text": g["text"], "start": offset, "dur": g["dur"]})
+                sentences.append({"text": g["text"], "start": offset, "dur": g["dur"], "speech": g["speech"]})
                 offset += g["dur"]
             scenes.append(
                 {
@@ -506,17 +546,20 @@ def image_is_valid(path):
         return False
 
 
-def to_video_frame(img):
+def to_zoom_source(img):
+    """Cover-crop to 16:9, upscale to SRC_W x SRC_H (LANCZOS), then clean up the line art."""
     img = img.convert("RGB")
     width, height = img.size
-    scale = max(W / width, H / height)
+    scale = max(SRC_W / width, SRC_H / height)
     resized = img.resize((round(width * scale), round(height * scale)), Image.Resampling.LANCZOS)
-    left = (resized.width - W) // 2
-    top = (resized.height - H) // 2
-    return resized.crop((left, top, left + W, top + H))
+    left = (resized.width - SRC_W) // 2
+    top = (resized.height - SRC_H) // 2
+    frame = resized.crop((left, top, left + SRC_W, top + SRC_H))
+    frame = ImageOps.autocontrast(frame, cutoff=1)
+    return frame.filter(ImageFilter.UnsharpMask(radius=2, percent=110, threshold=3))
 
 
-def make_fallback_image(title, path):
+def make_fallback_image(title):
     img = Image.new("RGB", (W, H), (250, 250, 250))
     draw = ImageDraw.Draw(img)
     for x in range(0, W, 80):
@@ -548,7 +591,7 @@ def make_fallback_image(title, path):
     for text_line in lines[:2]:
         draw.text((W // 2, y), text_line, font=font, fill=ink, anchor="mm")
         y += 70
-    img.save(path, "JPEG", quality=92)
+    return img
 
 
 def scene_context(scene):
@@ -559,26 +602,49 @@ def scene_context(scene):
     return re.sub(r"\s+", " ", context).strip()
 
 
+def build_sd_cmd(prompt, out_path, seed, width, height, steps):
+    return [
+        str(SD_BIN),
+        "-m", str(SD_MODEL),
+        "--lora-model-dir", str(LORA_DIR),
+        "-p", f"{prompt} <lora:{LORA_NAME}:1>",
+        "-n", SD_NEGATIVE,
+        "--sampling-method", "lcm",
+        "--steps", str(steps),
+        "--cfg-scale", SD_CFG,
+        "-W", str(width),
+        "-H", str(height),
+        "-t", "2",
+        "-s", str(seed),
+        "-o", str(out_path),
+    ]
+
+
+def sd_preflight():
+    """Make one quick image first so a wrong sd flag or LoRA problem fails in a minute, not after hours."""
+    test_path = IMG_DIR / "preflight.png"
+    if test_path.exists():
+        test_path.unlink()
+    cmd = build_sd_cmd(SD_PROMPT_PREFIX + "a stickman holding a coin", test_path, 1234, SD_WIDTH, SD_HEIGHT, 2)
+    started = time.time()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=SD_TIMEOUT, cwd=str(ROOT))
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"sd preflight timed out after {SD_TIMEOUT}s")
+    if result.returncode != 0 or not test_path.exists():
+        tail = (result.stderr or result.stdout or "")[-800:]
+        raise RuntimeError(f"sd preflight failed (rc={result.returncode}): {tail}")
+    test_path.unlink()
+    log(f"sd preflight ok ({time.time() - started:.0f}s for a 2-step image)")
+
+
 def generate_scene_image(prompt, index, base_seed):
     raw_path = IMG_DIR / f"raw_{index:03d}.png"
     for attempt in range(2):
         if raw_path.exists():
             raw_path.unlink()
         seed = base_seed + attempt * 7919
-        cmd = [
-            str(SD_BIN),
-            "-m", str(SD_MODEL),
-            "-p", prompt,
-            "-n", SD_NEGATIVE,
-            "--steps", "15",
-            "--cfg-scale", "7.0",
-            "-W", "768",
-            "-H", "512",
-            "-t", "2",
-            "-s", str(seed),
-            "--vae-tiling",
-            "-o", str(raw_path),
-        ]
+        cmd = build_sd_cmd(prompt, raw_path, seed, SD_WIDTH, SD_HEIGHT, SD_STEPS)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=350, cwd=str(ROOT))
         except subprocess.TimeoutExpired:
@@ -624,7 +690,7 @@ def build_images(scenes):
             elapsed = time.time() - started
             image_times.append(SD_TIMEOUT if status == "timeout" else elapsed)
             if raw_path is not None:
-                to_video_frame(Image.open(raw_path)).save(out_path, "JPEG", quality=92)
+                to_zoom_source(Image.open(raw_path)).save(out_path, "JPEG", quality=92)
                 last_good = out_path
                 generated.add(i)
                 done = True
@@ -644,7 +710,7 @@ def build_images(scenes):
                     frame = frame.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
                 frame.save(out_path, "JPEG", quality=92)
             else:
-                make_fallback_image(scene["title"], out_path)
+                to_zoom_source(make_fallback_image(scene["title"])).save(out_path, "JPEG", quality=92)
         scene["image"] = out_path
         scene["generated"] = i in generated
 
@@ -653,7 +719,7 @@ def build_images(scenes):
 
 
 # --------------------------------------------------------------------------- #
-# Stage 4: subtitles (punctuation-aware sync)
+# Stage 4: subtitles (punctuation-aware sync, 4 words per group)
 # --------------------------------------------------------------------------- #
 ASS_HEADER = """[Script Info]
 ScriptType: v4.00+
@@ -684,7 +750,7 @@ def escape_ass(text):
     return text.replace("\\", "").replace("{", "").replace("}", "").replace("\n", " ")
 
 
-def sentence_events(text, t0, t1):
+def sentence_events(text, t0, t1, speech_end):
     words = text.split()
     if not words or t1 - t0 < 0.05:
         return []
@@ -694,20 +760,22 @@ def sentence_events(text, t0, t1):
         bounds.append(bounds[-1] + weight)
     total = float(bounds[-1])
 
-    groups, current = [], []
-    for position, word in enumerate(words):
-        current.append(position)
-        if len(current) >= 3 or word[-1] in PUNCT_WEIGHT:
-            groups.append(current)
-            current = []
-    if current:
-        groups.append(current)
+    # Fixed groups of WORDS_PER_GROUP words; a lone trailing word joins the previous group.
+    groups = [
+        list(range(i, min(i + WORDS_PER_GROUP, len(words))))
+        for i in range(0, len(words), WORDS_PER_GROUP)
+    ]
+    if len(groups) > 1 and len(groups[-1]) == 1:
+        groups[-2].extend(groups.pop())
 
-    duration = t1 - t0
+    # Spread the words over the real speech only (silence trimmed); the last group stays until the sentence ends.
+    span = max(speech_end - t0, 0.05)
     events = []
-    for group in groups:
-        start = t0 + duration * bounds[group[0]] / total
-        end = t0 + duration * bounds[group[-1] + 1] / total
+    for number, group in enumerate(groups):
+        start = t0 + span * bounds[group[0]] / total
+        end = t0 + span * bounds[group[-1] + 1] / total
+        if number == len(groups) - 1:
+            end = max(end, t1)
         if end - start < 0.03:
             continue
         phrase = escape_ass(" ".join(words[p] for p in group))
@@ -718,12 +786,13 @@ def sentence_events(text, t0, t1):
 def build_ass(scenes):
     lines = [ASS_HEADER.rstrip("\n")]
     for scene in scenes:
-        scale = scene["timeline_dur"] / scene["duration"]
+        # Audio plays at real speed, so no time scaling: just clamp to the scene end.
         scene_end = scene["timeline_start"] + scene["timeline_dur"]
         for sentence in scene["sentences"]:
-            t0 = scene["timeline_start"] + sentence["start"] * scale
-            t1 = min(t0 + sentence["dur"] * scale, scene_end)
-            lines.extend(sentence_events(sentence["text"], t0, t1))
+            t0 = scene["timeline_start"] + sentence["start"]
+            t1 = min(t0 + sentence["dur"], scene_end)
+            speech_end = min(t0 + sentence["speech"], t1)
+            lines.extend(sentence_events(sentence["text"], t0, t1, speech_end))
     (WORK / "subs.ass").write_text("\n".join(lines) + "\n", encoding="utf-8")
     log("subs.ass written")
 
@@ -746,18 +815,54 @@ def probe_duration(path):
         return 0.0
 
 
+def zoom_filter(index, frames):
+    """Per-scene zoompan filter. Neighbouring scenes get different moves; the frame count is exact so audio sync holds."""
+    n = max(int(frames), 2)
+    move = index % 6
+    zr = ZOOM_RANGE
+    pz = PAN_ZOOM
+    mid_y = "(ih-ih/zoom)*0.5"
+    if move == 0:  # slow zoom in, centre
+        z, x, y = f"1+{zr}*on/{n}", "(iw-iw/zoom)*0.5", mid_y
+    elif move == 1:  # pan left to right
+        z, x, y = f"{pz}", f"(iw-iw/zoom)*on/{n}", mid_y
+    elif move == 2:  # slow zoom out, centre
+        z, x, y = f"{1 + zr}-{zr}*on/{n}", "(iw-iw/zoom)*0.5", mid_y
+    elif move == 3:  # pan right to left
+        z, x, y = f"{pz}", f"(iw-iw/zoom)*(1-on/{n})", mid_y
+    elif move == 4:  # zoom in towards the upper left
+        z, x, y = f"1+{zr}*on/{n}", "(iw-iw/zoom)*0.2", "(ih-ih/zoom)*0.25"
+    else:  # zoom in towards the lower right
+        z, x, y = f"1+{zr}*on/{n}", "(iw-iw/zoom)*0.8", "(ih-ih/zoom)*0.75"
+    return f"zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={W}x{H}:fps={FPS}"
+
+
 def assemble(scenes):
     valid = []
     cursor = 0.0
     for scene in scenes:
         chunk = CHUNK_DIR / f"chunk_{scene['index']:03d}.mp4"
+
+        # zoompan makes the frames itself from ONE input frame (no -loop, or the frame count would multiply).
+        # The count is derived from the audio length, then -t / -shortest trim to the exact audio duration.
+        frames = int(np.ceil(scene["duration"] * FPS)) + 4
+        fade_out_start = max(scene["duration"] - FADE_SEC, 0.0)
+        video_filter = (
+            f"{zoom_filter(scene['index'], frames)},"
+            "format=yuv420p,"
+            f"fade=t=in:st=0:d={FADE_SEC},"
+            f"fade=t=out:st={fade_out_start:.2f}:d={FADE_SEC}"
+        )
+
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-loop", "1", "-framerate", "15", "-i", str(scene["image"]),
+            "-i", str(scene["image"]),
             "-i", str(scene["wav"]),
-            "-vf", "scale=1280:720,format=yuv420p",
+            "-vf", video_filter,
+            "-r", str(FPS),
             "-c:v", "libx264", "-preset", "ultrafast",
             "-c:a", "aac", "-b:a", "128k",
+            "-t", f"{scene['duration']:.3f}",
             "-shortest", str(chunk),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -858,7 +963,8 @@ def make_thumbnail(scenes):
 # Main
 # --------------------------------------------------------------------------- #
 def check_prerequisites():
-    missing = [p.name for p in (SD_BIN, SD_MODEL, KOKORO_MODEL, KOKORO_VOICES) if not p.exists()]
+    lora_file = LORA_DIR / f"{LORA_NAME}.safetensors"
+    missing = [p.name for p in (SD_BIN, SD_MODEL, KOKORO_MODEL, KOKORO_VOICES, lora_file) if not p.exists()]
     if missing:
         raise RuntimeError(f"Missing required files: {', '.join(missing)}")
 
@@ -867,6 +973,7 @@ def main():
     for directory in (WORK, OUT, IMG_DIR, AUDIO_DIR, CHUNK_DIR):
         directory.mkdir(parents=True, exist_ok=True)
     check_prerequisites()
+    sd_preflight()
 
     log("Stage 1/6: script and SEO")
     topic, chapters = generate_script()
