@@ -1,90 +1,99 @@
-name: Ultimate 30-Min Local Finance Engine
+name: Daily Finance Video
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 3 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
-jobs:
-  build-production-video:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360 # GitHub Action ki max limit
+concurrency:
+  group: daily-finance-video
+  cancel-in-progress: false
 
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PYTHONUNBUFFERED: "1"
     steps:
-      - name: Checkout Code Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Initialize Python 3.11 Environment
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install System Tools & FFmpeg
+      - name: Install system dependencies
         run: |
-          set -e
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu espeak-ng wget build-essential cmake
-          
-      - name: Build Local SD Engine & Fetch Dreamshaper v8
+          sudo apt-get install -y ffmpeg fonts-dejavu fonts-liberation espeak-ng build-essential cmake git wget curl zstd ca-certificates
+
+      - name: Install Python dependencies
         run: |
-          set -e
+          python -m pip install --upgrade pip
+          pip install pillow numpy soundfile requests kokoro-onnx
+
+      - name: Build stable-diffusion.cpp
+        run: |
+          set -eu
           git clone --recursive https://github.com/leejet/stable-diffusion.cpp
           cd stable-diffusion.cpp
           mkdir build && cd build
-          
-          cmake .. 
-          cmake --build . --config Release
-          
-          # FIXED: Properly locating and copying the built binary
-          SD_BINARY=$(find . -name "sd" -type f -executable | head -n 1)
+          cmake ..
+          cmake --build . --config Release -j"$(nproc)"
+          SD_BINARY=$(find . -type f -executable -name "sd" | head -n 1)
           if [ -z "$SD_BINARY" ]; then
-            # Fallback path if find fails
-            cp bin/sd ../../sd
-          else
-            cp "$SD_BINARY" ../../sd
+            SD_BINARY=$(find . -type f -executable -name "sd-cli" | head -n 1)
           fi
-          
-          cd ../../
+          if [ -z "$SD_BINARY" ]; then
+            echo "ERROR: could not locate the stable-diffusion.cpp binary"
+            find . -type f -executable | head -n 50
+            exit 1
+          fi
+          echo "Located binary: $SD_BINARY"
+          cp "$SD_BINARY" "$GITHUB_WORKSPACE/sd"
+          cd "$GITHUB_WORKSPACE"
           chmod +x sd
-          
-          wget -q https://huggingface.co/Lykon/DreamShaper/resolve/main/DreamShaper_8_pruned.safetensors -O model.safetensors
+          ls -lh sd
 
-      - name: Fetch Local TTS Models (Kokoro)
+      - name: Download AI models
         run: |
-          set -e
-          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.onnx
-          wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin
+          set -eu
+          wget -nv --tries=5 --retry-connrefused --waitretry=5 \
+            "https://huggingface.co/Lykon/DreamShaper/resolve/main/DreamShaper_8_pruned.safetensors"
+          mv DreamShaper_8_pruned.safetensors model.safetensors
+          wget -nv --tries=5 --retry-connrefused --waitretry=5 \
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
+          wget -nv --tries=5 --retry-connrefused --waitretry=5 \
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+          ls -lh model.safetensors kokoro-v1.0.onnx voices-v1.0.bin
 
-      - name: Install Python Libraries
+      - name: Install and start Ollama
         run: |
-          set -e
-          python -m pip install --upgrade pip
-          pip install requests "Pillow==10.0.0" kokoro-onnx soundfile
-
-      - name: 🚀 EXECUTE 100% LOCAL PIPELINE
-        run: |
-          set -e
-          
-          echo "STARTING LOCAL AI SERVER (OLLAMA)"
           curl -fsSL https://ollama.com/install.sh | sh
-          ollama serve > /tmp/ollama.log 2>&1 &
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
           sleep 15
+          for i in $(seq 1 20); do
+            if curl -s http://127.0.0.1:11434/api/tags > /dev/null; then
+              echo "Ollama is up"
+              break
+            fi
+            sleep 3
+          done
           ollama pull gemma2:2b
-          
-          echo "IGNITING PYTHON ENTERPRISE ENGINE"
-          python -u pipeline.py
 
-      - name: Publish Standalone Cinematic Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run video pipeline
+        run: python -u pipeline.py
+
+      - name: Create GitHub release
         run: |
-          set -e
+          set -eu
           RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")
-          gh release create "v${RELEASE_TAG}" \
-            output/final_video.mp4 \
-            output/seo_metadata.txt \
-            output/thumbnail.jpg \
-            --title "Finance Masterclass (${RELEASE_TAG})" || echo "Release created."
+          gh release create "v${RELEASE_TAG}" output/final_video.mp4 output/seo_metadata.txt output/thumbnail.jpg \
+            --title "Finance Masterclass (${RELEASE_TAG})" \
+            --notes "Automatically generated finance documentary. See seo_metadata.txt for the title, description and tags."
