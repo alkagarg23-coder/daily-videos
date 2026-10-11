@@ -924,9 +924,29 @@ def assemble(scenes):
     return valid
 
 
+#  --------------------------------------------------------------------------- #
+# Stage 6: thumbnail (Authentic Whiteboard Style)
 # --------------------------------------------------------------------------- #
-# Stage 6: thumbnail
-# --------------------------------------------------------------------------- #
+def load_marker_font(size):
+    font_path = ROOT / "PermanentMarker.ttf"
+    if not font_path.exists():
+        # Auto-download authentic hand-drawn whiteboard font
+        url = "https://github.com/google/fonts/raw/main/apache/permanentmarker/PermanentMarker-Regular.ttf"
+        try:
+            log("Downloading 'Permanent Marker' font for authentic thumbnail...")
+            r = requests.get(url, timeout=15)
+            font_path.write_bytes(r.content)
+        except Exception as e:
+            log(f"Font download failed: {e}")
+    try:
+        return ImageFont.truetype(str(font_path), size)
+    except Exception:
+        try:
+            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+        except:
+            return ImageFont.load_default()
+
+
 def make_thumbnail(scenes):
     source = None
     if len(scenes) > 2 and scenes[2].get("generated"):
@@ -941,23 +961,38 @@ def make_thumbnail(scenes):
 
     base = Image.open(source).convert("RGB").resize((W, H), Image.Resampling.LANCZOS).convert("RGBA")
 
-    grad_w = int(W * 0.6)
-    ramp = np.linspace(215, 0, grad_w).astype(np.uint8)
+    # Subtle gradient so the text pops, but doesn't ruin the whiteboard look
+    grad_w = int(W * 0.7)
+    ramp = np.linspace(150, 0, grad_w).astype(np.uint8)
     alpha = np.zeros((H, W), dtype=np.uint8)
     alpha[:, :grad_w] = ramp[None, :]
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     overlay.putalpha(Image.fromarray(alpha))
     composed = Image.alpha_composite(base, overlay)
 
-    draw = ImageDraw.Draw(composed)
-    big = load_font(95)
-    small = load_font(65)
-    draw.text((50, 280), "STOP", font=big, fill="#EF4444", stroke_width=5, stroke_fill="black")
-    draw.text((50, 390), "DOING THIS", font=big, fill="#FACC15", stroke_width=5, stroke_fill="black")
-    draw.text((50, 500), "FINANCE SECRETS", font=small, fill="#FFFFFF", stroke_width=4, stroke_fill="black")
+    # Create a separate transparent layer for text so we can tilt it like real handwriting
+    txt_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(txt_layer)
+    
+    big = load_marker_font(130)
+    small = load_marker_font(85)
 
-    composed.convert("RGB").save(OUT / "thumbnail.jpg", "JPEG", quality=92, optimize=True)
+    # Authentic Colors matching the stickman vibe (White text, ultra-thick black outline)
+    fill_col = "#FFFFFF"
+    stroke_col = "#000000"
+    
+    draw.text((60, 230), "STOP", font=big, fill=fill_col, stroke_width=10, stroke_fill=stroke_col)
+    draw.text((60, 370), "DOING THIS", font=big, fill=fill_col, stroke_width=10, stroke_fill=stroke_col)
+    draw.text((60, 510), "FINANCE SECRETS", font=small, fill=fill_col, stroke_width=7, stroke_fill=stroke_col)
+
+    # Rotate the text layer by 3 degrees for a dynamic, hand-drawn YouTube thumbnail look
+    txt_layer = txt_layer.rotate(3, resample=Image.Resampling.BICUBIC)
+
+    # Merge the tilted text with the background
+    final_thumb = Image.alpha_composite(composed, txt_layer)
+    final_thumb.convert("RGB").save(OUT / "thumbnail.jpg", "JPEG", quality=95, optimize=True)
     log("Thumbnail saved")
+
 
 
 # --------------------------------------------------------------------------- #
