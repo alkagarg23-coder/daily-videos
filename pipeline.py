@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""100% local finance documentary pipeline (Ollama + Kokoro ONNX + stable-diffusion.cpp + FFmpeg)."""
+"""100% local finance documentary pipeline (Ollama + Kokoro ONNX + stable-diffusion.cpp + FFmpeg) with Cloud Fallback."""
 
 import datetime
 import gc
@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 import numpy as np
@@ -518,27 +519,11 @@ def build_scenes(chapters):
 
 
 # --------------------------------------------------------------------------- #
-# Stage 3: images
+# Stage 3: images (Dual Engine: Online Flux + Local Fallback + Cooldown)
 # --------------------------------------------------------------------------- #
-def load_font(size, bold=True):
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
-    ]
-    for candidate in candidates:
-        try:
-            return ImageFont.truetype(candidate, size)
-        except Exception:
-            continue
-    try:
-        return ImageFont.load_default(size=size)
-    except Exception:
-        return ImageFont.load_default()
-
-
 def image_is_valid(path):
     try:
-        img = Image.open(path).convert("RGB").resize((64, 64))
+                img = Image.open(path).convert("RGB").resize((64, 64))
         stat = ImageStat.Stat(img)
         mean = sum(stat.mean) / 3.0
         std = sum(stat.stddev) / 3.0
@@ -576,8 +561,17 @@ def make_fallback_image(title):
     draw.line((cx, cy + 80, cx - 60, cy + 190), fill=ink, width=8)
     draw.line((cx, cy + 80, cx + 60, cy + 190), fill=ink, width=8)
     draw.ellipse((cx + 95, cy - 160, cx + 175, cy - 80), outline=ink, width=8)
-    draw.text((cx + 135, cy - 120), "$", font=load_font(48), fill=ink, anchor="mm")
-    font = load_font(54)
+    
+    # Simple default font for fallback
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 54)
+        doll_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
+    except:
+        font = ImageFont.load_default()
+        doll_font = font
+        
+    draw.text((cx + 135, cy - 120), "$", font=doll_font, fill=ink, anchor="mm")
+    
     words, lines, line = title.split(), [], ""
     for word in words:
         trial = f"{line} {word}".strip()
@@ -641,20 +635,56 @@ def sd_preflight():
 
 def generate_scene_image(prompt, index, base_seed):
     raw_path = IMG_DIR / f"raw_{index:03d}.png"
+    
+    # 🌟 STEP 1: ANTI-BAN COOLDOWN (Wait after every 10 images)
+    if index > 0 and index % 10 == 0:
+        log(f"Cooling down for 25 seconds to prevent online API ban (Just finished {index} images)...")
+        time.sleep(25)
+        
+    sanitized_prompt = prompt.replace(SD_PROMPT_PREFIX, "").strip()
+    
+    # 🌟 STEP 2: TRY ONLINE "FLUX" GENERATION (FAST, HIGH QUALITY)
+    safe_prompt = urllib.parse.quote(f"simple black and white stick figure drawing on a clean whiteboard, thick black marker lines, flat 2d comic style, {sanitized_prompt}")
+    online_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1280&height=720&model=flux&nologo=true&seed={base_seed}&enhance=false"
+    
+    try:
+        log(f"Image {index}: Attempting Online FLUX Generation...")
+        response = requests.get(online_url, timeout=35)
+        if response.status_code == 200 and len(response.content) > 10000:
+            raw_path.write_bytes(response.content)
+            
+            if image_is_valid(raw_path):
+                # 🌟 STEP 3: WATERMARK DESTROYER (Cuts the bottom star logo and resizes back)
+                img = Image.open(raw_path)
+                w, h = img.size
+                # Crop bottom 60 pixels to completely remove any AI spark/star logos
+                cropped = img.crop((0, 0, w, h - 60))
+                # Resize back to original 1280x720 to prevent FFmpeg zoompan aspect ratio errors
+                cropped = cropped.resize((w, h), Image.Resampling.LANCZOS)
+                cropped.save(raw_path)
+                return raw_path, "ok"
+    except Exception as e:
+        log(f"Online Image attempt failed: {e}. Switching to Local Fallback...")
+
+    # 🌟 STEP 4: LOCAL SD.CPP FALLBACK (100% OFFLINE, SAFE)
     for attempt in range(2):
         if raw_path.exists():
             raw_path.unlink()
         seed = base_seed + attempt * 7919
         cmd = build_sd_cmd(prompt, raw_path, seed, SD_WIDTH, SD_HEIGHT, SD_STEPS)
         try:
+            log(f"Image {index}: Generation through offline local engine (Attempt {attempt + 1})...")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=350, cwd=str(ROOT))
         except subprocess.TimeoutExpired:
-            log(f"Image {index}: sd timed out after {SD_TIMEOUT}s")
+            log(f"Image {index}: sd offline timed out after {SD_TIMEOUT}s")
             return None, "timeout"
+            
         if result.returncode == 0 and raw_path.exists() and image_is_valid(raw_path):
             return raw_path, "ok"
+            
         tail = (result.stderr or result.stdout or "")[-300:].replace("\n", " ")
-        log(f"Image {index}: attempt {attempt + 1} failed or came out black (rc={result.returncode}) {tail}")
+        log(f"Image {index}: Local fallback failed or came out black (rc={result.returncode}) {tail}")
+        
     return None, "failed"
 
 
@@ -924,7 +954,7 @@ def assemble(scenes):
     return valid
 
 
-#  --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
 # Stage 6: thumbnail (Authentic Whiteboard Style)
 # --------------------------------------------------------------------------- #
 def load_marker_font(size):
@@ -988,11 +1018,10 @@ def make_thumbnail(scenes):
     # Rotate the text layer by 3 degrees for a dynamic, hand-drawn YouTube thumbnail look
     txt_layer = txt_layer.rotate(3, resample=Image.Resampling.BICUBIC)
 
-    # Merge the tilted text with the background
+        # Merge the tilted text with the background
     final_thumb = Image.alpha_composite(composed, txt_layer)
     final_thumb.convert("RGB").save(OUT / "thumbnail.jpg", "JPEG", quality=95, optimize=True)
     log("Thumbnail saved")
-
 
 
 # --------------------------------------------------------------------------- #
