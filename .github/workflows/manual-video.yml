@@ -1,121 +1,224 @@
-name: Daily Finance Video
+name: Stickman Finance Doodle Video
 
 on:
-  schedule:
-    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
-      test_mode:
-        description: "Short test run (tiny script, few images, published as pre-release)"
+      topic:
+        description: "Finance topic - leave as 'auto' and the pipeline picks a fresh topic itself"
+        required: false
+        default: "auto"
+      minutes:
+        description: "Maximum / target video length (minutes)"
+        type: choice
+        default: "25"
+        options: ["20", "25", "30"]
+      resolution:
+        description: "Output height"
+        type: choice
+        default: "720"
+        options: ["720", "1080"]
+      audience:
+        description: "Target audience (optional)"
+        required: false
+        default: ""
+      tone:
+        description: "Tone (optional)"
+        required: false
+        default: ""
+      animation:
+        type: choice
+        default: "random"
+        options: ["random", "cinematic", "minimal", "off"]
+      transition:
+        type: choice
+        default: "random"
+        options: ["random", "crossfade", "cinematic", "cut", "off"]
+      subtitle_mode:
+        description: "Words per subtitle round"
+        type: choice
+        default: "4"
+        options: ["4", "1", "2", "sentence"]
+      resume:
+        description: "Resume an earlier unfinished run of the same topic/length (restores cached project)"
         type: boolean
         default: false
+      upload_release:
+        description: "Also publish the video as a GitHub Release (no 500 MB artifact quota)"
+        type: boolean
+        default: false
+  # Uncomment to make a new video fully automatically (topic is auto-picked) every Monday 03:00 UTC:
+  # schedule:
+  #   - cron: "0 3 * * 1"
+
+concurrency:
+  group: doodle-video
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
-concurrency:
-  group: daily-finance-video
-  cancel-in-progress: false
-
 jobs:
-  build-and-publish:
+  build-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TOPIC: ${{ inputs.topic || 'auto' }}
+      MINUTES: ${{ inputs.minutes || '25' }}
+      RESOLUTION: ${{ inputs.resolution || '720' }}
+      AUDIENCE: ${{ inputs.audience }}
+      TONE: ${{ inputs.tone }}
+      ANIMATION: ${{ inputs.animation || 'random' }}
+      TRANSITION: ${{ inputs.transition || 'random' }}
+      SUBTITLE_MODE: ${{ inputs.subtitle_mode || '4' }}
+      OLLAMA_MODEL: gemma2:2b
+      SD_MODEL: Lykon/dreamshaper-8
+      SD_STEPS: "12"
+      # Pipeline-internal time budget (minutes, counted from pipeline start).
+      # Job limit is 355 min; ~25 min go to setup, the rest is protected by this budget.
+      BUDGET_MINUTES: "300"
       PYTHONUNBUFFERED: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      TOKENIZERS_PARALLELISM: "false"
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          df -h /
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install system dependencies
+      - name: System packages (FFmpeg, fonts, zstd)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu fonts-liberation espeak-ng build-essential cmake git wget curl zstd ca-certificates
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg fonts-dejavu-core zstd curl
+          ffmpeg -hide_banner -version | head -1
+          ffmpeg -hide_banner -filters | grep -E " (xfade|zoompan|ass) "
 
-      - name: Install Python dependencies
+      - name: Cache models and tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            tools
+            assets
+          key: doodle-assets-v1
+
+      - name: Python packages (CPU-only PyTorch)
         run: |
           python -m pip install --upgrade pip
-          pip install pillow numpy soundfile requests kokoro-onnx
+          pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==1.26.4 Pillow==10.4.0 requests==2.32.3 \
+            diffusers==0.30.3 transformers==4.44.2 accelerate==0.34.2 \
+            huggingface_hub==0.25.2 safetensors==0.4.5
 
-      - name: Build stable-diffusion.cpp
+      - name: Download Piper, voice and marker font
         run: |
-          set -eu
-          git clone --recursive https://github.com/leejet/stable-diffusion.cpp
-          cd stable-diffusion.cpp
-          mkdir build && cd build
-          cmake ..
-          cmake --build . --config Release -j"$(nproc)"
-          SD_BINARY=$(find . -type f -executable -name "sd" | head -n 1)
-          if [ -z "$SD_BINARY" ]; then
-            SD_BINARY=$(find . -type f -executable -name "sd-cli" | head -n 1)
+          mkdir -p tools/voices assets/fonts
+          if [ ! -x tools/piper/piper ]; then
+            curl -fsSL -o piper.tgz https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
+            tar -xzf piper.tgz -C tools
+            rm piper.tgz
           fi
-          if [ -z "$SD_BINARY" ]; then
-            echo "ERROR: could not locate the stable-diffusion.cpp binary"
-            find . -type f -executable | head -n 50
-            exit 1
-          fi
-          echo "Located binary: $SD_BINARY"
-          cp "$SD_BINARY" "$GITHUB_WORKSPACE/sd"
-          cd "$GITHUB_WORKSPACE"
-          chmod +x sd
-          ls -lh sd
+          V=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium
+          [ -s tools/voices/en_US-lessac-medium.onnx ] || curl -fsSL -o tools/voices/en_US-lessac-medium.onnx "$V/en_US-lessac-medium.onnx"
+          [ -s tools/voices/en_US-lessac-medium.onnx.json ] || curl -fsSL -o tools/voices/en_US-lessac-medium.onnx.json "$V/en_US-lessac-medium.onnx.json"
+          [ -s assets/fonts/PermanentMarker-Regular.ttf ] || curl -fsSL -o assets/fonts/PermanentMarker-Regular.ttf \
+            https://github.com/google/fonts/raw/main/apache/permanentmarker/PermanentMarker-Regular.ttf \
+            || echo "Marker font download failed - DejaVu Sans Bold will be used"
+          chmod +x tools/piper/piper
 
-      - name: Show sd options (debug)
+      - name: Piper preflight (fail early with a clear error)
         run: |
-          ./sd --help 2>&1 | head -n 120 || true
+          echo "Testing Piper." | tools/piper/piper --model tools/voices/en_US-lessac-medium.onnx \
+            --output_file /tmp/piper_test.wav --espeak_data tools/piper/espeak-ng-data
+          test -s /tmp/piper_test.wav
+          ls -l /tmp/piper_test.wav
 
-      - name: Download AI models
-        run: |
-          set -eu
-          wget -nv --tries=5 --retry-connrefused --waitretry=5 \
-            "https://huggingface.co/Lykon/DreamShaper/resolve/main/DreamShaper_8_pruned.safetensors"
-          mv DreamShaper_8_pruned.safetensors model.safetensors
-          mkdir -p loras
-          wget -nv --tries=5 --retry-connrefused --waitretry=5 \
-            -O loras/lcm-lora-sdv1.5.safetensors \
-            "https://huggingface.co/latent-consistency/lcm-lora-sdv1-5/resolve/main/pytorch_lora_weights.safetensors"
-          wget -nv --tries=5 --retry-connrefused --waitretry=5 \
-            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
-          wget -nv --tries=5 --retry-connrefused --waitretry=5 \
-            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
-          ls -lh model.safetensors loras/lcm-lora-sdv1.5.safetensors kokoro-v1.0.onnx voices-v1.0.bin
-
-      - name: Install and start Ollama
+      - name: Install Ollama and pull Gemma
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
-          nohup ollama serve > /tmp/ollama.log 2>&1 &
-          sleep 15
-          for i in $(seq 1 20); do
-            if curl -s http://127.0.0.1:11434/api/tags > /dev/null; then
-              echo "Ollama is up"
-              break
-            fi
-            sleep 3
-          done
-          ollama pull gemma2:2b
-
-      - name: Run video pipeline
-        env:
-          CHAPTER_WORDS: ${{ inputs.test_mode && '60' || '600' }}
-          MAX_PARTS_PER_CHAPTER: ${{ inputs.test_mode && '1' || '6' }}
-          IMAGE_DEADLINE_MIN: ${{ inputs.test_mode && '20' || '230' }}
-        run: python -u pipeline.py
-
-      - name: Create GitHub release
-        run: |
-          set -eu
-          RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")
-          EXTRA=""
-          if [ "${{ inputs.test_mode }}" = "true" ]; then
-            EXTRA="--prerelease"
+          if ! curl -fs http://127.0.0.1:11434/api/tags >/dev/null; then
+            nohup ollama serve > ollama.log 2>&1 &
+            for i in $(seq 1 60); do
+              curl -fs http://127.0.0.1:11434/api/tags >/dev/null && break
+              sleep 2
+            done
           fi
-          gh release create "v${RELEASE_TAG}" output/final_video.mp4 output/seo_metadata.txt output/thumbnail.jpg \
-            --title "Finance Masterclass (${RELEASE_TAG})" \
-            --notes "Automatically generated finance documentary. See seo_metadata.txt for the title, description and tags." \
-            $EXTRA
+          ollama pull "$OLLAMA_MODEL"
+          ollama list
+
+      - name: Compute project cache key
+        run: echo "PROJECT_KEY=$(echo -n "$TOPIC|$MINUTES|$RESOLUTION" | sha1sum | cut -c1-12)" >> "$GITHUB_ENV"
+
+      - name: Restore unfinished project (resume mode)
+        if: ${{ inputs.resume == true }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            projects
+            !projects/**/render/pieces/**
+          key: project-${{ env.PROJECT_KEY }}-${{ github.run_id }}
+          restore-keys: project-${{ env.PROJECT_KEY }}-
+
+      - name: Generate the video
+        run: python pipeline.py
+
+      - name: Save project checkpoint (also after failure or timeout)
+        if: ${{ always() && inputs.resume == true }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            projects
+            !projects/**/render/pieces/**
+          key: project-${{ env.PROJECT_KEY }}-${{ github.run_id }}
+
+      - name: Upload video artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: doodle-video-${{ github.run_number }}
+          path: output/videos/
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Remember the topic (so it is never repeated)
+        if: ${{ success() }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add topic_history.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Record used video topic"
+            git pull --rebase --autostash || true
+            git push || echo "Could not push topic history (check Settings > Actions > Workflow permissions)"
+          fi
+
+      - name: Publish GitHub Release
+        if: ${{ success() && inputs.upload_release == true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SLUG=$(jq -r .slug output/latest.json)
+          TITLE=$(jq -r .title output/latest.json)
+          gh release create "video-${{ github.run_number }}" output/videos/* \
+            --title "$TITLE" \
+            --notes-file "output/videos/${SLUG}_seo.txt"
+
+      - name: Upload logs on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_number }}
+          path: |
+            ollama.log
+            projects/*/project.json
+          if-no-files-found: ignore
+          retention-days: 3
