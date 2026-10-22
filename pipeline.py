@@ -1,27 +1,14 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Stickman Finance Doodle Studio - headless pipeline for GitHub Actions.
+"""Local-model stickman finance documentary builder for GitHub Actions.
 
-Stages (each one is checkpointed in projects/<slug>/project.json and resumable):
-  1. calibrate   measure real Piper speech speed (words/second)
-  2. script      Ollama (Gemma) writes the narration section by section
-  3. scenes      scene count is DYNAMIC (decided by the narration, never hard-coded)
-  4. audio       Piper voices every sentence, exact durations from sample counts
-  5. prompts     doodle prompts (style rules are hard-coded in this file)
-  6. images      DreamShaper v8 on CPU, time-budget aware, honest fallback doodles
-  7. subtitles   word timing from the real audio, 4-words-per-round by default
-  8. thumbnail   1280x720 via Pillow
-  9. render      per-scene motion + random transitions with FFmpeg, burned subtitles
- 10. verify      ffprobe validation of the final MP4
-
-Everything runs locally on the runner: no paid API, no API key, no cloud inference.
+No external AI API keys are required. Text generation, TTS and image generation
+run locally on the Actions runner after public model weights are downloaded.
+A normal GitHub-hosted Linux runner has no GPU, so SD-Turbo inference is CPU-based.
 """
 from __future__ import annotations
 
 import argparse
 import gc
-import hashlib
 import json
 import math
 import os
@@ -31,1922 +18,1199 @@ import shutil
 import subprocess
 import sys
 import time
-import wave
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import traceback
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Iterable
 
 import numpy as np
 import requests
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+import soundfile as sf
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-T0 = time.time()
-GAP = 0.28  # seconds of silence after every spoken sentence
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT / "studio_work"
+STATE_DIR = ROOT / ".studio_state"
+OUTPUT_DIR = ROOT / "output"
+CHECKPOINT = WORK / "checkpoint.json"
+SAMPLE_RATE = 24000
+FPS = 30
+WIDTH, HEIGHT = 1920, 1080
+IMAGE_INTERVAL = 5.0
+VIDEO_SECONDS_FULL = 30 * 60
+VIDEO_SECONDS_TEST = 60
+TEXT_MODEL_ID = os.environ.get("TEXT_MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
+IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "stabilityai/sdxl-turbo")
+VOICE_NAME = "am_puck"
+NEGATIVE_PROMPT = "colored skin on stickman, realistic human, 3d render, blurry, watermark, text, deformed limbs, low quality"
 
-STYLE_ANCHOR = (
-    "Hand-drawn 2D doodle cartoon animation, flat colors, bold black outlines, "
-    "slightly imperfect sketchy marker lines, educational YouTube explainer doodle style"
-)
-NEGATIVE_LOCK = (
-    "no gradients, no shadows, no textures, no photorealism, no 3D, "
-    "no realistic faces, no anime style"
-)
-NEGATIVE_EXTRA = (
-    "gradient, shadow, texture, photo, photorealistic, 3d render, realistic face, anime, "
-    "text, letters, words, watermark, signature, blurry, noisy, complex background, "
-    "multiple panels, frame, border"
-)
+TOPICS = [
+    "The Quiet Math Behind Lifestyle Inflation",
+    "Why High Earners Still Feel Broke",
+    "The Psychology of Debt and Minimum Payments",
+    "How Compound Growth Rewards Patience",
+    "The Hidden Cost of Buying Status",
+    "Why Emergency Funds Create Real Freedom",
+    "The Wealth Gap Between Income and Assets",
+    "How Inflation Changes Everyday Decisions",
+    "Why Your First Investment Habit Matters",
+    "The Behavioral Traps Behind Panic Selling",
+    "How Subscription Creep Drains Wealth",
+    "The Difference Between Looking Rich and Being Rich",
+    "Why Cash Flow Matters More Than Appearances",
+    "The Psychology of Spending After a Pay Raise",
+    "How High-Interest Debt Compounds Against You",
+    "Why Small Fees Can Become Big Financial Leaks",
+    "The Real Trade-Off Between Renting and Buying",
+    "How Opportunity Cost Shapes Your Future",
+    "Why Financial Advice Often Ignores Human Behavior",
+    "The Wealth-Building Power of Boring Consistency",
+    "How Consumer Credit Changes Spending Decisions",
+    "Why a Bigger Salary Does Not Guarantee Security",
+    "The Economics of Convenience Spending",
+    "How Risk and Time Horizon Work Together",
+    "Why Diversification Is a Behavior Strategy Too",
+    "The Hidden Price of Buy Now Pay Later",
+    "How Marketing Turns Wants Into Needs",
+    "Why Financial Goals Need a Time Frame",
+    "The Difference Between Saving and Investing",
+    "How Lifestyle Choices Affect Financial Optionality",
+    "Why Financial Stress Can Narrow Your Choices",
+    "The Economics of Owning Productive Assets",
+    "How Paycheck Timing Shapes Money Decisions",
+    "Why a Budget Is a Feedback System, Not a Punishment",
+    "The Psychology of Loss Aversion in Investing",
+    "How Inflation and Raises Interact Over Time",
+    "Why Financial Resilience Beats Perfect Forecasts",
+    "The Hidden Cost of Car Payments",
+    "How Social Comparison Distorts Money Goals",
+    "Why the First Ten Thousand Dollars Feel Different",
+    "The Risk of Confusing Luck With Skill",
+    "How Cash Reserves Change Negotiating Power",
+    "Why Debt-Free Does Not Automatically Mean Wealthy",
+    "The Economics of Time, Energy, and Money",
+    "How Financial Habits Become Automatic",
+    "Why Wealth Is Often Built Through Avoiding Mistakes",
+    "The Power and Limits of Compound Interest",
+    "How Financial Incentives Shape Everyday Life",
+    "Why Diversified Income Is Not the Same as Easy Money",
+    "The Psychology of Spending Windfalls",
+    "How to Think Clearly During a Market Crash",
+    "Why Financial Independence Is About Options",
+    "The Difference Between Net Worth and Cash Flow",
+    "How Debt Changes Future Freedom",
+    "Why a Good Plan Includes Uncertainty",
+    "The Hidden Economics of Free Trials",
+    "How Small Recurring Choices Shape Long-Term Wealth",
+    "Why Simple Financial Systems Beat Motivation",
+    "The Trade-Off Between Convenience and Control",
+    "How Money Stories Influence Risk Taking",
+    "Why Protecting Your Downside Matters",
+    "The Economics of Waiting Before You Buy",
+    "How a Financial Cushion Changes Career Choices",
+    "Why Wealth Is a System, Not a Single Trick",
+    "The Psychology of Delayed Gratification",
+    "How to Separate Market Noise From Long-Term Decisions",
+    "Why a High Savings Rate Creates Options",
+    "The Hidden Cost of Financial Overconfidence",
+    "How Fees, Taxes, and Inflation Interact",
+    "Why Your Money Plan Must Fit Your Real Life",
+]
 
-FINANCE_DNA = (
-    "You write narration for a calm, highly intelligent, hand-drawn doodle YouTube explainer about "
-    "macroeconomics, personal finance, market history and financial mechanics. Rules: "
-    "Speak in second person only (you, your wallet, your savings, your bank account). Never use 'we' or 'I'. "
-    "Rhythm: a short sentence. A short sentence. Then one longer sentence that builds structural depth. "
-    "Then a short sentence again. Ask a question every four to six sentences. "
-    "Every financial mechanism or piece of jargon must be decoded into plain English straight away with a real-world analogy. "
-    "Never invent statistics, historical market figures, quotations or sources; when unsure, stay general. "
-    "Never promise investment returns and never give personal investment advice. "
-    "Output ONLY the narration as plain flowing paragraphs: no headings, no bullet points, no markdown, "
-    "no stage directions, no emojis, no greeting."
-)
+CHAPTER_SPECS = [
+    ("The Moment Money Starts Controlling the Story", "Open with an ordinary money decision and expose the hidden trade-off behind it."),
+    ("The Numbers Beneath the Feeling", "Explain cash flow, compounding, purchasing power, and why arithmetic beats impressions."),
+    ("The Brain Wants Comfort Now", "Explore present bias, reward loops, social comparison, and emotional spending."),
+    ("Income Is Not the Same as Wealth", "Separate wages, savings, productive assets, liabilities, liquidity, and net worth."),
+    ("Debt Turns Tomorrow Into a Bill", "Explain interest, minimum payments, opportunity cost, and the value of reading terms."),
+    ("The Quiet Leak of Lifestyle Inflation", "Show how fixed commitments can absorb raises and reduce flexibility."),
+    ("Time Is a Financial Multiplier", "Explain time horizon, consistent contributions, uncertainty, and the limits of projections."),
+    ("Risk Is More Than a Number", "Discuss concentration, volatility, liquidity, job risk, and matching risk to capacity."),
+    ("The Systems That Make Good Choices Easier", "Explain budgets, automatic transfers, emergency reserves, and simple feedback loops."),
+    ("The Stories That Sell You Things", "Analyze status signaling, urgency, anchoring, defaults, and marketing incentives."),
+    ("Build a Plan That Survives Real Life", "Offer practical reflection questions and risk-aware steps without promises or stock picks."),
+    ("The Real Measure of Financial Freedom", "Bring the themes together around resilience, choice, time, and realistic expectations."),
+]
+
+TAG_LIST = [
+    "personal finance", "financial education", "wealth building", "money psychology", "investing basics",
+    "financial literacy", "compound interest", "debt payoff", "budgeting tips", "money habits",
+    "wealth mindset", "saving money", "behavioral finance", "stock market basics", "passive income basics",
+    "financial freedom", "inflation explained", "cash flow", "net worth", "credit card debt",
+    "emergency fund", "lifestyle inflation", "long term investing", "money management", "economics explained",
+    "financial independence", "spending habits", "risk management", "assets and liabilities", "smart money",
+    "financial mistakes", "investing psychology", "wealth gap", "money documentary", "stickman finance",
+]
+
+FALLBACK_SENTENCE_PATTERNS = [
+    "A useful way to study {topic} is to separate the visible choice from the incentives working behind it.",
+    "When you look only at the price today, you can miss the time, flexibility, and future options that the decision consumes.",
+    "The first question is not whether a choice looks impressive, but whether it supports the life you are trying to build.",
+    "A simple example makes the trade-off clearer: money assigned to one purpose cannot be used for another purpose at the same time.",
+    "That does not make every purchase wrong; it means every purchase has a cost beyond the number printed on the receipt.",
+    "Your future self inherits both the benefits and the commitments created by decisions that feel small in the present.",
+    "The arithmetic is often straightforward, but emotions can make a short-term reward feel more important than a long-term outcome.",
+    "You can reduce that conflict by deciding your rules before the pressure, advertising, or urgency arrives.",
+    "A useful financial system makes the preferred choice easier to repeat and the risky choice harder to make impulsively.",
+    "There is no universal number that works for everyone, because income, dependents, location, health, and job stability differ.",
+    "Treat any projection as a scenario rather than a promise, and ask what happens if returns are lower or expenses are higher.",
+    "The point is not to predict every surprise; the point is to make sure one surprise does not destroy the whole plan.",
+    "A longer time horizon can help with uncertainty, but it does not remove risk or guarantee a positive outcome.",
+    "When you compare options, include fees, taxes, interest, maintenance, time, and the possibility that your plans may change.",
+    "A decision that preserves flexibility can be valuable even when it does not produce the largest result in an optimistic forecast.",
+    "Notice how the decision feels before you make it, because urgency and embarrassment can be signals that deserve a pause.",
+    "The best next step is usually one you can explain clearly, afford under reasonable assumptions, and maintain consistently.",
+    "Small improvements become meaningful when they reduce repeated mistakes instead of depending on constant willpower.",
+    "Compare the outcome with your own goals rather than with a highlight reel built from somebody else's spending.",
+    "A resilient plan leaves room for ordinary life, including repairs, family needs, career changes, and periods of uncertainty.",
+    "If a financial offer depends on you ignoring the terms, rushing, or assuming the best possible outcome, slow down and examine it.",
+    "Financial progress is usually easier to measure through habits and balance-sheet changes than through a single exciting moment.",
+    "Your goal is not to eliminate every trade-off; it is to choose trade-offs deliberately rather than by default.",
+    "The lesson becomes practical when you turn it into one measurable decision that can be reviewed next month.",
+]
 
 
-# --------------------------------------------------------------------------- utils
-def log(msg, level="INFO"):
-    el = int(time.time() - T0)
-    print(f"[{el // 3600:02d}:{el % 3600 // 60:02d}:{el % 60:02d}] {level:5s} {msg}", flush=True)
+def log(message: str) -> None:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 
-def warn(msg):
-    log(msg, "WARN")
-
-
-class PipelineError(RuntimeError):
-    pass
-
-
-def save_json(path, data):
-    path = Path(path)
+def atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(path)
 
 
-def load_json(path, default=None):
+def load_json(path: Path, default: Any = None) -> Any:
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         return default
 
 
-def run(cmd, timeout=None, input_bytes=None, check=True, cwd=None):
-    cmd = [str(c) for c in cmd]
-    try:
-        p = subprocess.run(cmd, input=input_bytes, capture_output=True, timeout=timeout, cwd=cwd)
-    except subprocess.TimeoutExpired:
-        raise PipelineError(f"Command timed out after {timeout}s: {' '.join(cmd[:4])} ...")
-    if check and p.returncode != 0:
-        err = p.stderr.decode("utf-8", "replace")[-1800:]
-        raise PipelineError(f"Command failed ({p.returncode}): {' '.join(cmd[:5])} ...\n{err}")
-    return p
+def run_checked(command: list[str], *, cwd: Path | None = None, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    log("RUN: " + " ".join(str(part) for part in command[:8]) + (" ..." if len(command) > 8 else ""))
+    return subprocess.run(
+        command,
+        cwd=str(cwd) if cwd else None,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
 
 
-def even(x):
-    x = int(round(x))
-    return x if x % 2 == 0 else x + 1
+def assert_tools() -> None:
+    missing = [name for name in ("ffmpeg", "ffprobe") if shutil.which(name) is None]
+    if missing:
+        raise RuntimeError(f"Required system tools are missing: {', '.join(missing)}. The workflow must install ffmpeg.")
 
 
-FFMPEG = None
-FFPROBE = None
-
-
-def find_ffmpeg():
-    global FFMPEG, FFPROBE
-    FFMPEG = shutil.which("ffmpeg")
-    if not FFMPEG:
-        try:
-            import imageio_ffmpeg  # type: ignore
-            FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            FFMPEG = None
-    FFPROBE = shutil.which("ffprobe")
-    if not FFMPEG:
-        raise PipelineError("ffmpeg was not found. Install it (sudo apt-get install -y ffmpeg).")
-    log(f"ffmpeg: {FFMPEG}")
-    log(f"ffprobe: {FFPROBE or 'not found (using ffmpeg -i parsing)'}")
-
-
-def ffmpeg_has_filter(name):
-    p = run([FFMPEG, "-hide_banner", "-filters"], check=False)
-    return re.search(r"\s" + re.escape(name) + r"\s", p.stdout.decode("utf-8", "replace")) is not None
-
-
-def probe(path):
-    path = str(path)
-    info = {"duration": 0.0, "has_video": False, "has_audio": False, "width": 0, "height": 0, "nb_frames": 0}
-    if FFPROBE:
-        p = run([FFPROBE, "-v", "error", "-show_entries",
-                 "format=duration:stream=codec_type,width,height,nb_frames", "-of", "json", path], check=False)
-        if p.returncode == 0:
-            try:
-                j = json.loads(p.stdout or b"{}")
-                for s in j.get("streams", []):
-                    if s.get("codec_type") == "video":
-                        info["has_video"] = True
-                        info["width"] = int(s.get("width") or 0)
-                        info["height"] = int(s.get("height") or 0)
-                        try:
-                            info["nb_frames"] = int(s.get("nb_frames") or 0)
-                        except ValueError:
-                            pass
-                    elif s.get("codec_type") == "audio":
-                        info["has_audio"] = True
-                info["duration"] = float((j.get("format") or {}).get("duration") or 0.0)
-                return info
-            except Exception:
-                pass
-    p = run([FFMPEG, "-hide_banner", "-i", path], check=False)
-    txt = p.stderr.decode("utf-8", "replace")
-    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", txt)
-    if m:
-        info["duration"] = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-    info["has_video"] = re.search(r"Stream #.*Video:", txt) is not None
-    info["has_audio"] = re.search(r"Stream #.*Audio:", txt) is not None
-    m = re.search(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})", txt)
-    if m:
-        info["width"], info["height"] = int(m.group(1)), int(m.group(2))
-    return info
-
-
-# --------------------------------------------------------------------------- config
-def E(name, default):
-    v = os.environ.get(name)
-    return default if v in (None, "") else v
-
-
-def truthy(v):
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Stickman Finance Doodle Studio (headless)")
-    a = p.add_argument
-    a("--topic", default=E("TOPIC", "auto"), help="finance topic, or 'auto' to let the pipeline choose one")
-    a("--topic-history", default=E("TOPIC_HISTORY", "topic_history.json"))
-    a("--audience", default=E("AUDIENCE", "everyday people with no finance background"))
-    a("--tone", default=E("TONE", "calm, clear and quietly curious"))
-    a("--minutes", type=float, default=float(E("MINUTES", 25)), help="target / maximum video length")
-    a("--resolution", type=int, choices=[720, 1080], default=int(E("RESOLUTION", 720)))
-    a("--fps", type=int, default=int(E("FPS", 24)))
-    a("--piper", default=E("PIPER_BIN", "tools/piper/piper"))
-    a("--voice-model", default=E("VOICE_MODEL", "tools/voices/en_US-lessac-medium.onnx"))
-    a("--speed", type=float, default=float(E("SPEECH_SPEED", 1.0)))
-    a("--volume", type=float, default=float(E("VOLUME", 1.0)))
-    a("--animation", choices=["random", "cinematic", "minimal", "off"], default=E("ANIMATION", "random"))
-    a("--transition", choices=["random", "crossfade", "cut", "cinematic", "off"], default=E("TRANSITION", "random"))
-    a("--intensity", choices=["subtle", "medium", "strong"], default=E("INTENSITY", "medium"))
-    a("--transition-seconds", type=float, default=float(E("TRANSITION_SECONDS", 0.5)))
-    a("--seed", type=int, default=int(E("SEED", 0)))
-    a("--no-avoid-repeat", action="store_true", default=truthy(E("NO_AVOID_REPEAT", "false")))
-    a("--subtitle-mode", choices=["4", "1", "2", "sentence"], default=E("SUBTITLE_MODE", "4"))
-    a("--scene-seconds", type=float, default=float(E("SCENE_SECONDS", 14)))
-    a("--ollama-url", default=E("OLLAMA_URL", "http://127.0.0.1:11434"))
-    a("--ollama-model", default=E("OLLAMA_MODEL", "gemma2:2b"))
-    a("--sd-model", default=E("SD_MODEL", "Lykon/dreamshaper-8"))
-    a("--sd-steps", type=int, default=int(E("SD_STEPS", 14)))
-    a("--sd-min-steps", type=int, default=int(E("SD_MIN_STEPS", 6)))
-    # DreamShaper draws at a very low resolution (fast on CPU); every image is then upscaled to image-width x image-height
-    a("--sd-width", type=int, default=int(E("SD_WIDTH", 512)))
-    a("--sd-height", type=int, default=int(E("SD_HEIGHT", 288)))
-    a("--image-width", type=int, default=int(E("IMAGE_WIDTH", 1920)))
-    a("--image-height", type=int, default=int(E("IMAGE_HEIGHT", 1080)))
-    a("--guidance", type=float, default=float(E("SD_GUIDANCE", 6.0)))
-    a("--require-sd", action="store_true", default=truthy(E("REQUIRE_SD", "false")))
-    a("--budget-minutes", type=float, default=float(E("BUDGET_MINUTES", 300)))
-    a("--workdir", default=E("WORKDIR", "projects"))
-    a("--output", default=E("OUTPUT_DIR", "output"))
-    a("--font-dir", default=E("FONT_DIR", "assets/fonts"))
-    a("--smoke", action="store_true", default=truthy(E("SMOKE", "false")),
-      help="fast self-test: built-in script, doodle fallback images, silent audio if Piper is missing")
-    cfg = p.parse_args(argv)
-    cfg.topic = re.sub(r"\s+", " ", cfg.topic or "").strip()
-    cfg.auto_topic = cfg.topic.lower() in ("", "auto", "random", "auto-pick")
-    cfg.sd_width = max(256, cfg.sd_width // 8 * 8)
-    cfg.sd_height = max(256, cfg.sd_height // 8 * 8)
-    cfg.img_w, cfg.img_h = even(cfg.image_width), even(cfg.image_height)
-    cfg.H = cfg.resolution
-    cfg.W = even(cfg.resolution * 16 / 9)
-    cfg.transition_seconds = max(0.0, min(2.0, cfg.transition_seconds))
-    cfg.minutes = max(0.2, cfg.minutes)
-    return cfg
-
-
-class Paths:
-    def __init__(self, cfg, slug):
-        self.proj = Path(cfg.workdir) / slug
-        self.images = self.proj / "images"
-        self.audio = self.proj / "audio"
-        self.sent = self.audio / "sentences"
-        self.subs = self.proj / "subs"
-        self.render = self.proj / "render"
-        self.pieces = self.render / "pieces"
-        self.fonts = self.proj / "fonts"
-        self.state = self.proj / "project.json"
-        self.out = Path(cfg.output) / "videos"
-        for d in (self.images, self.sent, self.subs, self.pieces, self.fonts, self.out):
-            d.mkdir(parents=True, exist_ok=True)
-
-
-# --------------------------------------------------------------------------- text helpers
-def clean_narration(text):
+def normalize_text(text: str) -> str:
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
-    kept = []
-    for ln in text.splitlines():
-        ln = ln.strip()
-        if not ln:
-            continue
-        if re.match(r"^(#+\s|section\s*\d+|part\s*\d+|title\s*:|narrator\s*:|scene\s*\d+|\[.*\]$|\(.*\)$)", ln, re.I):
-            continue
-        if re.match(r"^(okay|ok|sure|certainly|here'?s|here is|of course)\b", ln, re.I) and len(ln.split()) < 25:
-            continue
-        if re.match(r"^(let me know|i hope|would you like)", ln, re.I):
-            continue
-        ln = re.sub(r"^\s*(?:[-*\u2022]|\d{1,2}[.)])\s+", "", ln)
-        kept.append(ln)
-    t = " ".join(kept)
-    t = t.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
-    t = t.replace("\u2014", ", ").replace("\u2013", ", ").replace("\u2026", ". ")
-    t = re.sub(r"\[[^\]]*\]", " ", t)
-    t = re.sub(r"[*_#`~|<>{}\\^=+]", " ", t)
-    t = re.sub(r"\$\s?(\d[\d,\.]*)", r"\1 dollars", t)
-    t = t.replace("$", " dollars ").replace("%", " percent").replace("&", " and ").replace("/", " ")
-    t = re.sub(r"[()]", "", t)
-    t = re.sub(r"[^A-Za-z0-9\s\.,\?!;:'\"\-]", " ", t)
-    t = re.sub(r"\bWe\b", "You", t)
-    t = re.sub(r"\bwe\b", "you", t)
-    t = re.sub(r"\bOur\b", "Your", t)
-    t = re.sub(r"\bour\b", "your", t)
-    t = re.sub(r"\bourselves\b", "yourselves", t)
-    t = re.sub(r"\.{2,}", ".", t)
-    t = re.sub(r"\s+([.,?!;:])", r"\1", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    text = re.sub(r"^\s{0,3}#{1,6}\s+.*$", " ", text, flags=re.M)
+    text = re.sub(r"^\s*\d+[.)]\s+", "", text, flags=re.M)
+    text = re.sub(r"\*\*(.*?)\*\*|__(.*?)__", lambda m: m.group(1) or m.group(2), text)
+    text = re.sub(r"[*_`#]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def split_long(s, limit=38):
-    words = s.split()
-    if len(words) <= limit:
-        return [s]
-    parts = re.split(r"(?<=[,;:])\s+", s)
-    out, cur = [], ""
-    for part in parts:
-        if cur and len((cur + " " + part).split()) > limit:
-            out.append(cur)
-            cur = part
-        else:
-            cur = (cur + " " + part).strip()
-    if cur:
-        out.append(cur)
-    final = []
-    for o in out:
-        w = o.split()
-        while len(w) > limit + 8:
-            final.append(" ".join(w[:limit]))
-            w = w[limit:]
-        final.append(" ".join(w))
-    res = []
-    for x in final:
-        x = x.strip()
-        if not x:
-            continue
-        if not re.search(r"[.!?]$", x):
-            x = x.rstrip(",;:") + "."
-        res.append(x)
-    return res
-
-
-def split_sentences(text):
-    raw = re.split(r"(?<=[.!?])\s+(?=[\"'A-Z0-9])", text)
-    out = []
-    for r in raw:
-        r = r.strip().strip('"').strip()
-        if len(re.sub(r"\W", "", r)) < 2:
-            continue
-        if not re.search(r"[.!?]$", r):
-            r = r.rstrip(",;:") + "."
-        out.extend(split_long(r))
-    return out
-
-
-def wcount(sentences):
-    return sum(len(s.split()) for s in sentences)
-
-
-# --------------------------------------------------------------------------- Ollama
-class Ollama:
-    def __init__(self, url, model):
-        self.url = url.rstrip("/")
-        self.model = model
-        self.proc = None
-
-    def alive(self):
-        try:
-            return requests.get(self.url + "/api/tags", timeout=3).status_code == 200
-        except Exception:
-            return False
-
-    def start(self):
-        if self.alive():
-            return
-        if not shutil.which("ollama"):
-            raise PipelineError("Ollama is not installed and not reachable at " + self.url)
-        log("Starting 'ollama serve' ...")
-        self.proc = subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for _ in range(60):
-            if self.alive():
-                return
-            time.sleep(2)
-        raise PipelineError("Ollama server did not start within 120 s")
-
-    def installed(self):
-        r = requests.get(self.url + "/api/tags", timeout=10).json()
-        return [m.get("name", "") for m in r.get("models", [])]
-
-    def ensure_model(self):
-        names = self.installed()
-        want = self.model
-        if want in names or (":" not in want and any(n.startswith(want + ":") for n in names)):
-            log(f"Ollama model ready: {want}")
-            return
-        if shutil.which("ollama"):
-            log(f"Pulling {want} (one-time download) ...")
-            run(["ollama", "pull", want], timeout=1800)
-            if want in self.installed():
-                return
-        others = [n for n in self.installed() if n.lower().startswith("gemma")]
-        if others:
-            warn(f"{want} missing, using installed Gemma model {others[0]}")
-            self.model = others[0]
-            return
-        raise PipelineError(f"Ollama model {want} is not available")
-
-    def generate(self, prompt, system="", num_predict=400, temperature=0.7, tries=3):
-        last = None
-        for attempt in range(1, tries + 1):
-            try:
-                r = requests.post(
-                    self.url + "/api/generate",
-                    json={
-                        "model": self.model, "prompt": prompt, "system": system, "stream": False,
-                        "keep_alive": "30m",
-                        "options": {"temperature": temperature, "top_p": 0.9, "repeat_penalty": 1.12,
-                                    "num_predict": int(num_predict), "num_ctx": 3072},
-                    },
-                    timeout=(10, 900),
-                )
-                r.raise_for_status()
-                txt = (r.json().get("response") or "").strip()
-                if txt:
-                    return txt
-                last = "empty response"
-            except Exception as e:  # noqa: BLE001
-                last = str(e)
-            warn(f"Ollama attempt {attempt}/{tries} failed: {last}")
-            time.sleep(3 * attempt)
-        raise PipelineError(f"Ollama failed after {tries} attempts: {last}")
-
-    def unload(self):
-        try:
-            requests.post(self.url + "/api/generate", json={"model": self.model, "keep_alive": 0}, timeout=20)
-        except Exception:
-            pass
-
-
-# --------------------------------------------------------------------------- Piper
-class Piper:
-    def __init__(self, cfg):
-        self.exe = Path(cfg.piper)
-        self.model = Path(cfg.voice_model)
-        self.speed = max(0.5, min(2.0, cfg.speed))
-        self.volume = cfg.volume
-        self.available = self.exe.exists() and self.model.exists()
-        self.rate = 22050
-        cj = load_json(str(self.model) + ".json", {}) or {}
-        try:
-            self.rate = int(cj.get("audio", {}).get("sample_rate", 22050))
-        except Exception:
-            self.rate = 22050
-        self.espeak = self.exe.parent / "espeak-ng-data"
-
-    def synth(self, text, out_path):
-        out_path = Path(out_path)
-        cmd = [str(self.exe.resolve()), "--model", str(self.model.resolve()), "--output_file", str(out_path.resolve()),
-               "--length_scale", f"{1.0 / self.speed:.3f}", "--sentence_silence", "0.0"]
-        if self.espeak.exists():
-            cmd += ["--espeak_data", str(self.espeak.resolve())]
-        run(cmd, timeout=180, input_bytes=(text + "\n").encode("utf-8"))
-        if not out_path.exists() or out_path.stat().st_size < 100:
-            raise PipelineError("Piper produced no audio for: " + text[:60])
-
-
-def read_wav(path):
-    with wave.open(str(path), "rb") as w:
-        return w.getnchannels(), w.getsampwidth(), w.getframerate(), w.readframes(w.getnframes())
-
-
-def write_wav(path, rate, samples):
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(np.asarray(samples, dtype=np.int16).tobytes())
-
-
-def wav_samples(path, rate):
-    """Return mono int16 samples at `rate`; convert with ffmpeg only if the file differs."""
-    nch, sw, fr, raw = read_wav(path)
-    if (nch, sw, fr) != (1, 2, rate):
-        tmp = Path(str(path) + ".conv.wav")
-        run([FFMPEG, "-y", "-v", "error", "-i", path, "-ar", rate, "-ac", 1, "-sample_fmt", "s16", tmp])
-        os.replace(tmp, path)
-        nch, sw, fr, raw = read_wav(path)
-    return np.frombuffer(raw, dtype=np.int16)
-
-
-def est_speech_seconds(text, speed):
-    return max(0.8, len(text.split()) / (2.75 * speed))
-
-
-def tts_sentence(cfg, piper, text, P, rate):
-    """Voice one sentence. Cached by content. Returns (path, used_fallback)."""
-    key = hashlib.sha1(f"{piper.model.name}|{piper.speed}|{text}".encode()).hexdigest()[:16]
-    out = P.sent / f"{key}.wav"
-    if out.exists() and out.stat().st_size > 100:
-        return out, False
-    if piper.available:
-        last = None
-        for attempt in range(3):
-            try:
-                piper.synth(text, out)
-                return out, False
-            except Exception as e:  # noqa: BLE001
-                last = e
-                time.sleep(1 + attempt)
-        warn(f"Piper failed for a sentence, using silent placeholder: {last}")
-    n = int(est_speech_seconds(text, piper.speed) * rate)
-    write_wav(out, rate, np.zeros(n, dtype=np.int16))
-    return out, True
-
-
-# --------------------------------------------------------------------------- analysis (mood / objects / labels)
-MOOD_RULES = [
-    ("orange", ["crash", "collapse", "panic", "crisis", "hyperinflation", "inflation", "bubble", "default",
-                "bank run", "recession", "depression", "meltdown", "bankrupt"]),
-    ("tan", ["ancient", "barter", "medieval", "roman", "empire", "merchant", "gold standard", "history",
-             "historical", "coin", "centuries"]),
-    ("blue", ["bank", "central bank", "corporat", "company", "federal reserve", "interest rate", "loan",
-              "credit", "stock market", "investor", "mortgage"]),
-]
-RED_WORDS = ["panic", "crash", "collapse", "debt", "crisis", "loss", "lose", "broke", "fear", "hyperinflation",
-             "default", "bankrupt", "poorer", "steal", "stolen", "shrink"]
-GREEN_WORDS = ["profit", "wealth", "save", "saving", "growth", "grow", "earn", "invest", "gain", "rich", "compound"]
-OBJECT_RULES = [
-    (["coffee", "latte", "cafe"], "a big coffee cup", "coffee"),
-    (["bank", "loan", "credit", "federal", "mortgage"], "an oversized bank building", "bank"),
-    (["save", "saving", "piggy", "wallet", "deposit"], "a simple piggy bank", "piggy"),
-    (["inflation", "price", "rate", "graph", "growth", "chart", "market", "stock"], "a basic graph with a giant arrow", "graph"),
-    (["gold", "coin", "barter", "silver"], "a pile of big gold coins", "coins"),
-    (["debt", "owe"], "a heavy chain tied to a big dollar sign", "dollar"),
-]
-LABEL_RULES = [
-    ("hyperinflation", "HYPERINFLATION!"), ("inflation", "INFLATION?"), ("crash", "CRASH!"),
-    ("collapse", "COLLAPSE!"), ("panic", "PANIC!"), ("debt", "DEBT!"), ("central bank", "CENTRAL BANK"),
-    ("bank", "THE BANK"), ("saving", "YOUR SAVINGS"), ("coffee", "YOUR COFFEE"), ("gold", "GOLD"),
-    ("interest", "INTEREST"), ("profit", "PROFIT!"), ("loan", "LOAN?"), ("price", "PRICES?"),
-    ("wealth", "WEALTH"), ("money", "MONEY?"),
-]
-
-
-def has_word(text, kw):
-    return re.search(r"\b" + re.escape(kw), text) is not None
-
-
-def analyze(narration, title):
-    t = (narration + " " + title).lower()
-    mood = "white"
-    for name, kws in MOOD_RULES:
-        if any(has_word(t, k) for k in kws):
-            mood = name
-            break
-    red = sum(1 for k in RED_WORDS if has_word(t, k))
-    green = sum(1 for k in GREEN_WORDS if has_word(t, k))
-    fill = "red" if red > green else ("green" if green > 0 else "white")
-    objs, drawer = [], None
-    for kws, phrase, dr in OBJECT_RULES:
-        if any(has_word(t, k) for k in kws):
-            objs.append(phrase)
-            drawer = drawer or dr
-        if len(objs) == 2:
-            break
-    if not objs:
-        objs, drawer = ["a big dollar sign"], "dollar"
-    label = None
-    for kw, lab in LABEL_RULES:
-        if has_word(t, kw):
-            label = lab
-            break
-    emotion = {"red": "panic", "green": "happy", "white": "neutral"}[fill]
-    return {"mood": mood, "fill": fill, "objects": objs, "drawer": drawer, "label": label, "emotion": emotion}
-
-
-BG_PHRASE = {
-    "white": "flat solid white background with a flat green strip along the bottom as ground",
-    "orange": "flat solid orange background",
-    "blue": "flat solid blue background",
-    "tan": "flat solid tan background",
-}
-BG_RGB = {"white": (255, 255, 255), "orange": (255, 150, 40), "blue": (80, 140, 225), "tan": (222, 190, 140)}
-FILL_RGB = {"red": (235, 64, 52), "green": (84, 200, 96), "white": (255, 255, 255)}
-INK = (15, 15, 15)
-
-
-def build_prompt(analysis, idea):
-    fill_word = {"red": "red-filled", "green": "green-filled", "white": "white-filled"}[analysis["fill"]]
-    objs = ", ".join(analysis["objects"])
-    pos = (f"{STYLE_ANCHOR}, one simple stick figure with a large circular {fill_word} head, dot eyes, "
-           f"thick expressive eyebrow lines, {idea}, {objs}, {BG_PHRASE[analysis['mood']]}, chunky simplified cartoon objects")
-    neg = NEGATIVE_LOCK + ", " + NEGATIVE_EXTRA
-    return pos, neg
-
-
-# --------------------------------------------------------------------------- fonts / drawing
-def find_font(cfg):
-    cands = []
-    fd = Path(cfg.font_dir)
-    if fd.exists():
-        cands += sorted(fd.glob("*.ttf")) + sorted(fd.glob("*.otf"))
-    cands += [Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-              Path("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf")]
-    for c in cands:
-        if c.exists():
-            return str(c)
-    return None
-
-
-def load_font(fp, size):
-    size = max(8, int(size))
-    if fp:
-        try:
-            return ImageFont.truetype(fp, size)
-        except Exception:
-            pass
-    try:
-        return ImageFont.load_default(size)
-    except Exception:
-        return ImageFont.load_default()
-
-
-def text_center(d, xy, text, font, fill, stroke=0, stroke_fill=None):
-    bb = d.textbbox((0, 0), text, font=font, stroke_width=stroke)
-    w, h = bb[2] - bb[0], bb[3] - bb[1]
-    d.text((xy[0] - w / 2 - bb[0], xy[1] - h / 2 - bb[1]), text, font=font, fill=fill,
-           stroke_width=stroke, stroke_fill=stroke_fill)
-
-
-def draw_arrow(d, p0, p1, color, width):
-    d.line([p0, p1], fill=color, width=width)
-    ang = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
-    L = width * 4
-    a1, a2 = ang + math.radians(150), ang - math.radians(150)
-    d.polygon([p1, (p1[0] + L * math.cos(a1), p1[1] + L * math.sin(a1)),
-               (p1[0] + L * math.cos(a2), p1[1] + L * math.sin(a2))], fill=color)
-
-
-def add_label(img, text, fp, seed):
+def split_sentences(text: str) -> list[str]:
+    text = normalize_text(text)
     if not text:
-        return img
-    img = img.copy()
-    d = ImageDraw.Draw(img)
-    W, H = img.size
-    f = load_font(fp, H * 0.085)
-    bb = d.textbbox((0, 0), text, font=f)
-    tw, th = bb[2] - bb[0], bb[3] - bb[1]
-    pad = int(H * 0.03)
-    left = seed % 2 == 0
-    x0 = int(W * 0.04) if left else W - tw - 2 * pad - int(W * 0.04)
-    y0 = int(H * 0.05)
-    ow = max(3, H // 100)
-    d.rounded_rectangle([x0, y0, x0 + tw + 2 * pad, y0 + th + 2 * pad], radius=pad, fill=(255, 212, 0), outline=INK, width=ow)
-    d.text((x0 + pad - bb[0], y0 + pad - bb[1]), text, font=f, fill=INK)
-    sx, sy = x0 + (tw + 2 * pad) // 2, y0 + th + 2 * pad + 4
-    ex = int(W * (0.5 + (0.1 if left else -0.1)))
-    draw_arrow(d, (sx, sy), (ex, int(H * 0.42)), (255, 190, 0), max(4, H // 70))
-    return img
+        return []
+    # Preserve punctuation while splitting ordinary documentary prose into TTS units.
+    pieces = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9“\"'])", text)
+    result: list[str] = []
+    for item in pieces:
+        item = item.strip()
+        if item:
+            if item[-1] not in ".!?…":
+                item += "."
+            result.append(item)
+    return result
 
 
-def draw_stick(d, cx, gy, H, fill, emotion, rng):
-    u = H / 400.0
-    w = max(3, int(7 * u))
-    r = int(46 * u)
-    hip_y = gy - int(95 * u)
-    neck_y = hip_y - int(100 * u)
-    hc = neck_y - r
-    d.line([(cx, neck_y), (cx, hip_y)], fill=INK, width=w)
-    sway = rng.choice([-1, 1])
-    if emotion == "panic":
-        d.line([(cx, neck_y + 15 * u), (cx - 60 * u, neck_y - 35 * u)], fill=INK, width=w)
-        d.line([(cx, neck_y + 15 * u), (cx + 60 * u, neck_y - 35 * u)], fill=INK, width=w)
-    elif emotion == "happy":
-        d.line([(cx, neck_y + 20 * u), (cx - 65 * u, neck_y - 10 * u)], fill=INK, width=w)
-        d.line([(cx, neck_y + 20 * u), (cx + 65 * u, neck_y - 10 * u)], fill=INK, width=w)
-    else:
-        d.line([(cx, neck_y + 20 * u), (cx - 55 * u * sway, neck_y + 65 * u)], fill=INK, width=w)
-        d.line([(cx, neck_y + 20 * u), (cx + 60 * u * sway, neck_y + 45 * u)], fill=INK, width=w)
-    d.line([(cx, hip_y), (cx - 45 * u, gy)], fill=INK, width=w)
-    d.line([(cx, hip_y), (cx + 45 * u, gy)], fill=INK, width=w)
-    d.ellipse([cx - r, hc - r, cx + r, hc + r], fill=fill, outline=INK, width=w)
-    ex, er = int(r * 0.4), max(3, int(5 * u))
-    for s in (-1, 1):
-        d.ellipse([cx + s * ex - er, hc - er, cx + s * ex + er, hc + er], fill=INK)
-    by = hc - int(r * 0.35)
-    for s in (-1, 1):
-        if emotion == "panic":
-            d.line([(cx + s * ex * 1.8, by - 9 * u), (cx + s * ex * 0.3, by + 5 * u)], fill=INK, width=w)
-        elif emotion == "happy":
-            d.line([(cx + s * ex * 1.8, by + 3 * u), (cx + s * ex * 0.3, by - 4 * u)], fill=INK, width=w)
-        else:
-            d.line([(cx + s * ex * 1.6, by), (cx + s * ex * 0.4, by)], fill=INK, width=w)
-    my = hc + int(r * 0.45)
-    if emotion == "happy":
-        d.arc([cx - r * 0.5, my - r * 0.4, cx + r * 0.5, my + r * 0.3], 10, 170, fill=INK, width=w)
-    elif emotion == "panic":
-        d.ellipse([cx - r * 0.18, my - r * 0.1, cx + r * 0.18, my + r * 0.3], fill=INK)
-    else:
-        d.line([(cx - r * 0.3, my + 3 * u), (cx + r * 0.3, my + 3 * u)], fill=INK, width=w)
+def word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w’'-]+\b", text, flags=re.UNICODE))
 
 
-def obj_dollar(d, x, gy, H, rng, fp):
-    r = int(H * 0.2)
-    cy = gy - int(H * 0.3)
-    d.ellipse([x - r, cy - r, x + r, cy + r], fill=(255, 212, 0), outline=INK, width=max(4, H // 70))
-    text_center(d, (x, cy), "$", load_font(fp, r * 1.5), INK)
-
-
-def obj_bank(d, x, gy, H, rng, fp):
-    w, h = int(H * 0.55), int(H * 0.42)
-    ow = max(3, H // 90)
-    top = gy - h
-    d.polygon([(x - w // 2 - 10, top + 30), (x, top - 20), (x + w // 2 + 10, top + 30)], fill=(235, 235, 235), outline=INK)
-    d.rectangle([x - w // 2, top + 30, x + w // 2, gy], fill=(240, 240, 240), outline=INK, width=ow)
-    for i in range(4):
-        cx = x - w // 2 + int((i + 0.5) * w / 4)
-        d.rectangle([cx - 10, top + 45, cx + 10, gy - 12], fill=(200, 200, 205), outline=INK, width=ow)
-    text_center(d, (x, top + 12), "$", load_font(fp, 28), INK)
-
-
-def obj_piggy(d, x, gy, H, rng, fp):
-    ow = max(3, H // 90)
-    bw, bh = int(H * 0.5), int(H * 0.32)
-    cy = gy - int(H * 0.22)
-    d.ellipse([x - bw // 2, cy - bh // 2, x + bw // 2, cy + bh // 2], fill=(255, 170, 190), outline=INK, width=ow)
-    d.ellipse([x + bw // 2 - 20, cy - 12, x + bw // 2 + 25, cy + 22], fill=(255, 140, 170), outline=INK, width=ow)
-    d.polygon([(x + 5, cy - bh // 2 + 8), (x + 35, cy - bh // 2 - 28), (x + 50, cy - bh // 2 + 12)], fill=(255, 140, 170), outline=INK)
-    for dx in (-bw // 4, bw // 4):
-        d.rectangle([x + dx - 10, cy + bh // 2 - 6, x + dx + 10, gy], fill=(255, 140, 170), outline=INK, width=ow)
-    d.line([(x - 25, cy - bh // 2 + 14), (x + 5, cy - bh // 2 + 14)], fill=INK, width=ow + 1)
-    d.ellipse([x + bw // 4 - 5, cy - 20, x + bw // 4 + 5, cy - 10], fill=INK)
-
-
-def obj_graph(d, x, gy, H, rng, fp):
-    ow = max(4, H // 70)
-    w, h = int(H * 0.7), int(H * 0.45)
-    x0, y0 = x - w // 2, gy - 10
-    d.line([(x0, y0 - h), (x0, y0), (x0 + w, y0)], fill=INK, width=ow)
-    up = rng.random() < 0.65
-    pts = [(x0 + 15, y0 - 20), (x0 + w * 0.3, y0 - h * (0.35 if up else 0.7)), (x0 + w * 0.55, y0 - h * (0.25 if up else 0.5)),
-           (x0 + w * 0.9, y0 - h * (0.9 if up else 0.12))]
-    d.line(pts, fill=(220, 40, 40) if not up else (30, 150, 60), width=ow + 2, joint="curve")
-    draw_arrow(d, pts[-2], pts[-1], (220, 40, 40) if not up else (30, 150, 60), ow + 2)
-
-
-def obj_coffee(d, x, gy, H, rng, fp):
-    ow = max(3, H // 90)
-    w, h = int(H * 0.3), int(H * 0.32)
-    top = gy - h
-    d.rectangle([x - w // 2, top, x + w // 2, gy - 4], fill=(150, 95, 60), outline=INK, width=ow)
-    d.ellipse([x + w // 2 - 6, top + 15, x + w // 2 + 38, top + h * 0.65], outline=INK, width=ow + 1)
-    for dx in (-18, 0, 18):
-        d.line([(x + dx, top - 8), (x + dx + 8, top - 28), (x + dx - 4, top - 46)], fill=INK, width=max(2, ow - 1))
-
-
-def obj_coins(d, x, gy, H, rng, fp):
-    ow = max(3, H // 90)
-    for row in range(3):
-        for i in range(3 - row):
-            cx = x - 60 + i * 60 + row * 30
-            cy = gy - 20 - row * 34
-            d.ellipse([cx - 32, cy - 16, cx + 32, cy + 16], fill=(255, 212, 0), outline=INK, width=ow)
-
-
-DRAWERS = {"dollar": obj_dollar, "bank": obj_bank, "piggy": obj_piggy, "graph": obj_graph,
-           "coffee": obj_coffee, "coins": obj_coins}
-
-
-def upscale_hd(img, W, H):
-    """Upscale a low-resolution DreamShaper image to W x H (cover + centre crop), then restore crisp doodle lines."""
-    scale = max(W / img.width, H / img.height)
-    big = img.resize((max(W, int(round(img.width * scale))), max(H, int(round(img.height * scale)))), Image.LANCZOS)
-    l, t = (big.width - W) // 2, (big.height - H) // 2
-    big = big.crop((l, t, l + W, t + H))
-    big = big.filter(ImageFilter.UnsharpMask(radius=2.2, percent=140, threshold=2))
-    big = ImageEnhance.Color(big).enhance(1.15)
-    return ImageEnhance.Contrast(big).enhance(1.08)
-
-
-def draw_fallback(scene, W, H, seed, fp):
-    """Procedural doodle used only when DreamShaper cannot run. Each scene gets its own drawing."""
-    rng = random.Random(seed)
-    info = scene["analysis"]
-    img = Image.new("RGB", (W, H), BG_RGB[info["mood"]])
-    d = ImageDraw.Draw(img)
-    gy = H - int(H * 0.13)
-    d.rectangle([0, gy, W, H], fill=(66, 170, 72))
-    d.line([0, gy, W, gy], fill=INK, width=max(3, H // 90))
-    fx = int(W * rng.choice([0.26, 0.32, 0.68, 0.74]))
-    ox = W - fx
-    draw_stick(d, fx, gy, H, FILL_RGB[info["fill"]], info["emotion"], rng)
-    DRAWERS.get(info["drawer"] or "dollar", obj_dollar)(d, ox, gy, H, rng, fp)
-    return add_label(img, info.get("label"), fp, seed)
-
-
-# --------------------------------------------------------------------------- image engine
-class SDEngine:
-    def __init__(self, cfg):
-        import torch
-        from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
-
-        self.torch = torch
-        torch.set_num_threads(max(1, os.cpu_count() or 2))
-        src = cfg.sd_model
-        t0 = time.time()
-        log(f"Loading image model {src} (first run downloads ~2 GB) ...")
-        kw = dict(torch_dtype=torch.float32, safety_checker=None, requires_safety_checker=False)
-        if os.path.isfile(src):
-            pipe = StableDiffusionPipeline.from_single_file(src, **kw)
-        else:
-            try:
-                pipe = StableDiffusionPipeline.from_pretrained(src, variant="fp16", **kw)
-            except Exception as e:  # noqa: BLE001
-                warn(f"fp16 variant unavailable ({str(e)[:120]}), loading default weights")
-                pipe = StableDiffusionPipeline.from_pretrained(src, **kw)
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-            pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
-        pipe.set_progress_bar_config(disable=True)
+def github_release_history() -> list[dict[str, Any]]:
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not repo or not token:
+        return []
+    headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}", "X-GitHub-Api-Version": "2022-11-28"}
+    releases: list[dict[str, Any]] = []
+    for page in range(1, 4):
         try:
-            pipe.enable_attention_slicing()
-        except Exception:
-            pass
-        self.pipe = pipe
-        self.cfg = cfg
-        log(f"Image model ready in {time.time() - t0:.0f}s")
-
-    def generate(self, prompt, negative, seed, steps):
-        torch = self.torch
-        g = torch.Generator("cpu").manual_seed(int(seed) % (2 ** 31))
-        with torch.inference_mode():
-            out = self.pipe(prompt=prompt, negative_prompt=negative, num_inference_steps=int(steps),
-                            guidance_scale=self.cfg.guidance, width=self.cfg.sd_width, height=self.cfg.sd_height,
-                            generator=g)
-        return out.images[0].convert("RGB")
-
-
-# --------------------------------------------------------------------------- state
-def stage_done(state, name):
-    return bool(state["stages"].get(name))
-
-
-def mark(P, state, name, **extra):
-    state["stages"][name] = True
-    state.update(extra)
-    save_json(P.state, state)
-
-
-# --------------------------------------------------------------------------- stage 1: calibrate
-CAL_TEXT = [
-    "Picture this. You tap your card to pay for a coffee.",
-    "It takes two seconds. Nothing about it feels strange.",
-    "But the hidden machinery behind that tiny payment is far stranger than you think.",
-    "Every number on your screen is a promise written by a bank.",
-    "So where does that promise come from, and who decides how much of it exists?",
-]
-
-
-def stage_calibrate(cfg, P, state, piper):
-    if stage_done(state, "calibrate"):
-        return state["wps"]
-    wps = 2.3 * piper.speed
-    if piper.available:
-        try:
-            total = 0.0
-            words = 0
-            cal = P.audio / "calibration"
-            cal.mkdir(parents=True, exist_ok=True)
-            for i, s in enumerate(CAL_TEXT):
-                out = cal / f"c{i}.wav"
-                piper.synth(s, out)
-                n = len(wav_samples(out, piper.rate))
-                total += n / piper.rate + GAP
-                words += len(s.split())
-            wps = words / total
-            log(f"Calibrated speech speed: {wps:.2f} words/second (incl. pauses)")
-        except Exception as e:  # noqa: BLE001
-            warn(f"Calibration failed, using default speed estimate: {e}")
-    else:
-        warn("Piper not available - using default speed estimate")
-    mark(P, state, "calibrate", wps=wps)
-    return wps
-
-
-# --------------------------------------------------------------------------- stage 2: script
-DEEPER = ["What most people miss", "Who benefits and who pays", "How it echoes through history",
-          "What it means for ordinary savers", "The trade-offs behind the scenes", "Where the system is fragile",
-          "How the pressure shows up in daily prices", "Why the rules keep changing",
-          "The incentives nobody talks about", "How small choices add up over years"]
-GENERIC_TITLES = ["The hidden incentives", "What history shows", "Where the pressure builds", "The ripple effects",
-                  "Who gains and who pays", "The trade-offs nobody mentions", "How it feels in daily life",
-                  "The mechanism step by step", "Why it breaks", "What changes next"]
-
-
-def smoke_sections(topic, target_words):
-    base = [
-        "You tap your card to pay for a coffee.", "It takes two seconds.",
-        "But the hidden machinery behind that payment is far stranger than you think.",
-        f"Behind it sits the story of {topic.lower()}.",
-        "Think of money like a promise written on a very large piece of paper.",
-        "When more promises are written, each one buys a little less.",
-        "So who decides how many promises exist?",
-        "A central bank does, and it moves levers that most people never see, much like a thermostat quietly steering the temperature of an entire house.",
-        "Short sentence. Long consequences.",
-        "Your savings feel solid, yet they sit inside this moving system.",
-        "Does that mean you should panic?",
-        "No, it means you should understand the machine.",
-    ]
-    mirror = ["History keeps repeating one simple lesson about trust and scarcity.",
-              "Look at your own grocery receipt and you will see that lesson in action.",
-              "This video is educational and not financial advice."]
-    sections, words, i = [], 0, 0
-    while words < max(60, target_words - 60):
-        chunk = [base[(i + k) % len(base)] for k in range(8)]
-        sections.append({"title": f"Part {len(sections) + 1}", "role": "hook" if not sections else "body", "sentences": chunk})
-        words += wcount(chunk)
-        i += 3
-    sections.append({"title": "Modern mirror", "role": "mirror", "sentences": mirror})
-    return sections
-
-
-def llm_outline(llm, topic, n):
-    titles = []
-    for _ in range(3):
-        have = "; ".join(titles)
-        prompt = (f"Topic: {topic}\nGive {n - len(titles)} short, distinct section titles (max 7 words each) that walk "
-                  f"through this topic step by step, from basic mechanics to deeper consequences."
-                  + (f" Do not repeat these: {have}." if have else "")
-                  + " One title per line, no numbering, no extra text.")
-        try:
-            txt = llm.generate(prompt, "You are a careful documentary outliner.", num_predict=160, temperature=0.6, tries=2)
-        except PipelineError:
-            break
-        for ln in txt.splitlines():
-            ln = re.sub(r"^\s*(?:[-*\u2022]|\d{1,2}[.)])\s*", "", ln).strip().strip('"*')
-            ln = re.sub(r"[^A-Za-z0-9 ,:'\-?]", "", ln)
-            if 2 <= len(ln.split()) <= 12 and ln.lower() not in [t.lower() for t in titles]:
-                titles.append(ln)
-        if len(titles) >= n:
-            break
-    k = 0
-    while len(titles) < n:
-        titles.append(GENERIC_TITLES[k % len(GENERIC_TITLES)] + (f" ({k // len(GENERIC_TITLES) + 2})" if k >= len(GENERIC_TITLES) else ""))
-        k += 1
-    return titles[:n]
-
-
-def gen_section(llm, cfg, role, title, idx, total, prev_tail, words):
-    if role == "hook":
-        role_txt = ("Open with a relatable modern financial moment (for example buying a cup of coffee), then say clearly that the "
-                    "hidden machinery behind that moment is far stranger than it looks, and reframe the concept.")
-    elif role == "mirror":
-        role_txt = ("This is the final section. Reflect the historical or systemic economic truth back onto something the viewer "
-                    "experiences in their own financial life today. End with one memorable closing sentence and a brief reminder "
-                    "that this video is educational and not financial advice.")
-    else:
-        role_txt = "Explain this part of the topic clearly. Introduce one new idea and decode any jargon with an analogy."
-    prompt = (f"Video topic: {cfg.topic}\nAudience: {cfg.audience}\nTone: {cfg.tone}\n"
-              f"Section {idx} of {total}: \"{title}\"\n{role_txt}\n"
-              f"Write about {words} words.\n"
-              + (f"The previous section ended with: \"{prev_tail}\"\nContinue naturally, without repeating it.\n" if prev_tail else "")
-              + "Narration only.")
-    best = []
-    for attempt in range(3):
-        txt = llm.generate(prompt, FINANCE_DNA, num_predict=int(words * 1.9) + 40, temperature=0.7)
-        sents = split_sentences(clean_narration(txt))
-        if wcount(sents) > wcount(best):
-            best = sents
-        if wcount(best) >= 0.55 * words:
-            break
-        warn(f"Section '{title}' too short ({wcount(sents)} words), retrying")
-    if not best:
-        raise PipelineError(f"Gemma returned no usable text for section '{title}'")
-    if role != "mirror":
-        while wcount(best) > 1.5 * words and len(best) > 3:
-            best.pop()
-    return best
-
-
-def stage_script(cfg, P, state, wps, llm):
-    if stage_done(state, "script") and state.get("sections"):
-        return state["sections"]
-    target = int(cfg.minutes * 60 * wps * 0.985)
-    log(f"Target narration: ~{target} words for {cfg.minutes:g} minutes")
-    if cfg.smoke:
-        sections = smoke_sections(cfg.topic, target)
-    else:
-        hook_w, mirror_w, sec_w = 170, 140, 230
-        n_body = max(1, round((target - hook_w - mirror_w) / sec_w))
-        total = n_body + 2
-        titles = llm_outline(llm, cfg.topic, n_body)
-        sections = []
-        t0 = time.time()
-        sections.append({"title": "The hook", "role": "hook",
-                         "sentences": gen_section(llm, cfg, "hook", f"The hook: {cfg.topic}", 1, total, "", hook_w)})
-        log(f"Section 1/{total} done ({wcount(sections[-1]['sentences'])} words)")
-        for i, t in enumerate(titles, start=2):
-            tail = " ".join(sections[-1]["sentences"][-2:])
-            sections.append({"title": t, "role": "body",
-                             "sentences": gen_section(llm, cfg, "body", t, i, total, tail, sec_w)})
-            log(f"Section {i}/{total} done ({wcount(sections[-1]['sentences'])} words, {time.time() - t0:.0f}s elapsed)")
-        extra = 0
-        while sum(wcount(s["sentences"]) for s in sections) + mirror_w < target * 0.99 and extra < 12:
-            need = target - sum(wcount(s["sentences"]) for s in sections) - mirror_w
-            if need < 70:
+            response = requests.get(f"https://api.github.com/repos/{repo}/releases", headers=headers, params={"per_page": 100, "page": page}, timeout=20)
+            if response.status_code == 404:
                 break
-            t = DEEPER[extra % len(DEEPER)]
-            extra += 1
-            tail = " ".join(sections[-1]["sentences"][-2:])
-            sections.append({"title": t, "role": "body",
-                             "sentences": gen_section(llm, cfg, "body", t, len(sections) + 1, total + extra, tail, int(min(sec_w, need)))})
-            log(f"Extra section '{t}' added ({wcount(sections[-1]['sentences'])} words)")
-        tail = " ".join(sections[-1]["sentences"][-2:])
-        sections.append({"title": "Modern mirror", "role": "mirror",
-                         "sentences": gen_section(llm, cfg, "mirror", "Modern mirror", total + extra, total + extra, tail, mirror_w)})
-        llm.unload()
-    # never exceed the time limit: trim middle sections' trailing sentences if the script is too long
-    limit_words = int(cfg.minutes * 60 * wps * 0.995)
-    while sum(wcount(s["sentences"]) for s in sections) > limit_words:
-        mids = [s for s in sections[1:-1] if len(s["sentences"]) > 4]
-        if not mids:
+            response.raise_for_status()
+            batch = response.json()
+            if not batch:
+                break
+            releases.extend(batch)
+            if len(batch) < 100:
+                break
+        except requests.RequestException as exc:
+            log(f"Release history lookup failed; local topic history will be used: {exc}")
             break
-        big = max(mids, key=lambda s: len(s["sentences"]))
-        big["sentences"].pop()
-        warn("Script above time limit - trimmed one sentence")
-    total_words = sum(wcount(s["sentences"]) for s in sections)
-    log(f"Script ready: {len(sections)} sections, {total_words} words (~{total_words / wps / 60:.1f} min)")
-    save_json(P.proj / "script.json", {"topic": cfg.topic, "sections": sections})
-    mark(P, state, "script", sections=sections)
-    return sections
+    return releases
 
 
-# --------------------------------------------------------------------------- stage 3: scenes (dynamic count)
-def stage_scenes(cfg, P, state, wps):
-    if stage_done(state, "scenes") and state.get("scenes"):
-        return state["scenes"]
-    target_words = max(12, int(cfg.scene_seconds * wps))
-    scenes, cur, cur_titles = [], [], []
-
-    def flush():
-        nonlocal cur, cur_titles
-        if cur:
-            scenes.append({"section": cur_titles[0], "sentences": cur})
-        cur, cur_titles = [], []
-
-    for sec in state["sections"]:
-        for s in sec["sentences"]:
-            if not cur:
-                cur_titles = [sec["title"]]
-            cur.append(s)
-            if wcount(cur) >= target_words:
-                flush()
-        if cur and wcount(cur) >= 0.45 * target_words:
-            flush()
-    flush()
-    if len(scenes) > 1 and wcount(scenes[-1]["sentences"]) < 0.3 * target_words:
-        last = scenes.pop()
-        scenes[-1]["sentences"] += last["sentences"]
-    for i, sc in enumerate(scenes, start=1):
-        sc["id"] = i
-        sc["narration"] = " ".join(sc["sentences"])
-    log(f"Scene plan: {len(scenes)} scenes (decided by the narration, no fixed limit)")
-    mark(P, state, "scenes", scenes=scenes)
-    return scenes
+def select_topic() -> str:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    local_history = load_json(STATE_DIR / "topics.json", {"topics": []})
+    used = {str(item).strip().casefold() for item in local_history.get("topics", [])}
+    for release in github_release_history():
+        title = str(release.get("name") or "")
+        body = str(release.get("body") or "")
+        for candidate in (title, body):
+            match = re.search(r"(?im)^\s*topic\s*:\s*(.+?)\s*$", candidate)
+            if match:
+                used.add(match.group(1).strip().casefold())
+        for topic in TOPICS:
+            if topic.casefold() in title.casefold():
+                used.add(topic.casefold())
+    available = [topic for topic in TOPICS if topic.casefold() not in used]
+    if available:
+        chosen = random.SystemRandom().choice(available)
+    else:
+        # Preserve uniqueness after the base pool is consumed by adding a fresh angle marker.
+        base = random.SystemRandom().choice(TOPICS)
+        nonce = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") + " " + uuid.uuid4().hex[:6]
+        chosen = f"{base} — a new case study ({nonce})"
+    known = list(local_history.get("topics", []))
+    known.append(chosen)
+    atomic_json(STATE_DIR / "topics.json", {"topics": known[-1000:]})
+    return chosen
 
 
-# --------------------------------------------------------------------------- stage 4: audio
-def stage_audio(cfg, P, state, piper):
-    scenes = state["scenes"]
-    narr = P.audio / "narration.wav"
-    if stage_done(state, "audio") and narr.exists() and all("sent_timing" in s for s in scenes):
-        return scenes
-    if not piper.available and not cfg.smoke:
-        raise PipelineError(f"Piper or its voice is missing (exe={piper.exe}, voice={piper.model}).")
-    rate = piper.rate
-    uniq = []
-    for sc in scenes:
-        for s in sc["sentences"]:
-            if s not in uniq:
-                uniq.append(s)
-    log(f"Voicing {len(uniq)} sentences with Piper ...")
-    paths, fallbacks = {}, 0
-    workers = max(1, min(3, os.cpu_count() or 2))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(tts_sentence, cfg, piper, s, P, rate): s for s in uniq}
-        for k, f in enumerate(as_completed(futs), start=1):
-            s = futs[f]
-            path, fb = f.result()
-            paths[s] = path
-            fallbacks += 1 if fb else 0
-            if k % 50 == 0:
-                log(f"  voiced {k}/{len(uniq)}")
-    if fallbacks and not cfg.smoke and fallbacks > max(2, 0.1 * len(uniq)):
-        raise PipelineError(f"Too many sentences failed in Piper ({fallbacks}/{len(uniq)}).")
-    samples = {s: wav_samples(p, rate) for s, p in paths.items()}
-
-    def scene_seconds(sc):
-        return sum(len(samples[s]) / rate + GAP for s in sc["sentences"])
-
-    limit = cfg.minutes * 60.0
-    total = sum(scene_seconds(sc) for sc in scenes)
-    removed = 0
-    while total > limit and len(scenes) > 4:
-        idx = min(len(scenes) - 3, max(1, int(len(scenes) * 0.6)))
-        sc = scenes.pop(idx)
-        total -= scene_seconds(sc)
-        removed += 1
-    if removed:
-        warn(f"Narration exceeded {cfg.minutes:g} min - removed {removed} middle scene(s) to stay inside the limit")
-        for i, sc in enumerate(scenes, start=1):
-            sc["id"] = i
-    gap = np.zeros(int(GAP * rate), dtype=np.int16)
-    chunks, t = [], 0.0
-    vol = max(0.1, min(2.0, cfg.volume))
-    for sc in scenes:
-        sc["start"] = t
-        off = 0.0
-        sc["sent_timing"] = []
-        for s in sc["sentences"]:
-            a = samples[s]
-            if vol != 1.0:
-                a = np.clip(a.astype(np.float32) * vol, -32768, 32767).astype(np.int16)
-            d = len(a) / rate
-            sc["sent_timing"].append({"text": s, "start": off, "dur": d})
-            chunks += [a, gap]
-            off += d + len(gap) / rate
-        sc["duration"] = off
-        sc["end"] = t + off
-        t += off
-    write_wav(narr, rate, np.concatenate(chunks))
-    log(f"Narration: {len(scenes)} scenes, {t / 60:.2f} min ({t:.1f}s), limit {cfg.minutes:g} min")
-    if t < cfg.minutes * 60 * 0.85:
-        warn(f"Narration is shorter than 85% of the target ({t / 60:.1f} of {cfg.minutes:g} min)")
-    mark(P, state, "audio", scenes=scenes, total_seconds=t, audio_rate=rate, tts_fallbacks=fallbacks)
-    return scenes
-
-
-# --------------------------------------------------------------------------- stage 5: prompts
-def stage_prompts(cfg, P, state, llm):
-    scenes = state["scenes"]
-    if stage_done(state, "prompts") and all("visual_prompt" in s for s in scenes):
-        return
-    use_llm = not cfg.smoke
-    for sc in scenes:
-        sc["analysis"] = analyze(sc["narration"], sc["section"])
-        idea = None
-        if use_llm:
-            try:
-                q = (f"Narration: \"{sc['narration'][:420]}\"\n"
-                     "Describe ONE simple hand-drawn doodle scene that illustrates this narration, in a single sentence of at most 22 words. "
-                     "A stick figure with a big round head does something with one or two chunky finance objects "
-                     "(dollar sign, piggy bank, bank building, graph with an arrow, coins). Mention the figure's emotion. "
-                     "No text, no quotes. Output only that sentence.")
-                txt = llm.generate(q, "You describe simple doodle illustrations.", num_predict=70, temperature=0.8, tries=2)
-                txt = re.sub(r"[\"*\n]", " ", txt).strip()
-                txt = re.sub(r"\s+", " ", txt)
-                txt = split_sentences(txt)[0] if split_sentences(txt) else ""
-                if 4 <= len(txt.split()) <= 40:
-                    idea = txt.rstrip(".")
-            except Exception as e:  # noqa: BLE001
-                warn(f"Scene {sc['id']}: prompt idea fell back to template ({str(e)[:80]})")
-        if not idea:
-            mood_word = {"panic": "looking worried", "happy": "smiling happily", "neutral": "looking curious"}[sc["analysis"]["emotion"]]
-            idea = f"a stick figure {mood_word} next to {sc['analysis']['objects'][0]}"
-        sc["visual_prompt"], sc["negative_prompt"] = build_prompt(sc["analysis"], idea)
-    if use_llm:
-        llm.unload()
-    mark(P, state, "prompts", scenes=scenes)
-
-
-# --------------------------------------------------------------------------- stage 6: images
-def image_ok(P, sc):
-    p = P.images / f"scene_{sc['id']:04d}.png"
-    return sc.get("image_source") in ("sd", "fallback") and p.exists() and p.stat().st_size > 1000
-
-
-def stage_images(cfg, P, state, deadline, fp):
-    scenes = state["scenes"]
-    todo = [s for s in scenes if not image_ok(P, s)]
-    log(f"Images: {len(scenes)} scenes, {len(todo)} to create, time left for images {max(0, deadline - time.time()) / 60:.0f} min")
-    engine, sd_fail_reason = None, None
-    if todo and not cfg.smoke:
-        try:
-            engine = SDEngine(cfg)
-        except Exception as e:  # noqa: BLE001
-            sd_fail_reason = f"image model could not load: {str(e)[:200]}"
-            if cfg.require_sd:
-                raise PipelineError(sd_fail_reason)
-            warn(sd_fail_reason + " -> using clearly marked fallback doodles")
-    elif cfg.smoke:
-        sd_fail_reason = "smoke mode"
-    sec_per_step, consecutive_fail = None, 0
-    for k, sc in enumerate(todo):
-        path = P.images / f"scene_{sc['id']:04d}.png"
-        seed = state["seed"] + sc["id"] * 7919
-        steps, img, why = cfg.sd_steps, None, None
-        if engine is not None:
-            remaining = deadline - time.time()
-            allow = remaining / max(1, len(todo) - k)
-            if remaining <= 0:
-                why = "time budget exhausted"
-            elif sec_per_step:
-                fit = int((allow * 0.92 - 3.0) / sec_per_step)
-                if fit < cfg.sd_min_steps:
-                    why = f"time budget too tight ({allow:.0f}s per image)"
-                else:
-                    steps = min(cfg.sd_steps, fit)
-            if why is None:
-                for attempt in range(2):
-                    try:
-                        t = time.time()
-                        raw = engine.generate(sc["visual_prompt"], sc["negative_prompt"], seed + attempt, steps)
-                        dt = time.time() - t
-                        sps = dt / steps
-                        sec_per_step = sps if sec_per_step is None else 0.7 * sec_per_step + 0.3 * sps
-                        img = add_label(upscale_hd(raw, cfg.img_w, cfg.img_h), sc["analysis"].get("label"), fp, seed)
-                        consecutive_fail = 0
-                        log(f"  image {k + 1}/{len(todo)} scene {sc['id']} ok: {dt:.0f}s, {steps} steps")
-                        break
-                    except Exception as e:  # noqa: BLE001
-                        why = f"generation error: {str(e)[:150]}"
-                        warn(f"Scene {sc['id']} attempt {attempt + 1} failed: {why}")
-                        gc.collect()
-                        time.sleep(2 * (attempt + 1))
-                if img is None:
-                    consecutive_fail += 1
-                    if consecutive_fail >= 3 and not cfg.require_sd:
-                        warn("3 image failures in a row - disabling the image model for the rest of the run")
-                        engine = None
-                        sd_fail_reason = why
-                    elif cfg.require_sd:
-                        raise PipelineError(f"Scene {sc['id']}: {why}")
-        else:
-            why = why or sd_fail_reason or "image model unavailable"
-        if img is None:
-            img = draw_fallback(sc, cfg.img_w, cfg.img_h, seed, fp)
-            sc["image_source"] = "fallback"
-            sc["fallback_reason"] = why or sd_fail_reason or "unknown"
-            if cfg.smoke is False:
-                warn(f"Scene {sc['id']}: FALLBACK doodle used ({sc['fallback_reason']})")
-        else:
-            sc["image_source"] = "sd"
-            sc.pop("fallback_reason", None)
-        img.save(path)
-        sc["image"] = str(path)
-        if (k + 1) % 5 == 0 or k == len(todo) - 1:
-            save_json(P.state, state)
-    n_fb = sum(1 for s in scenes if s.get("image_source") == "fallback")
-    log(f"Images complete: {len(scenes) - n_fb} DreamShaper, {n_fb} fallback")
-    engine = None
-    gc.collect()
-    mark(P, state, "images", scenes=scenes)
-
-
-# --------------------------------------------------------------------------- stage 7: subtitles
-def srt_time(t):
-    ms = int(round(t * 1000))
-    return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
-
-
-def ass_time(t):
-    cs = int(round(t * 100))
-    return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
-
-
-def build_cues(scenes, mode):
-    cues = []
-    for sc in scenes:
-        for st in sc["sent_timing"]:
-            words = st["text"].split()
-            if not words:
-                continue
-            n = len(words)
-            weights = []
-            for i, w in enumerate(words):
-                wt = max(1, len(re.sub(r"\W", "", w)))
-                if i < n - 1:
-                    if w[-1] in ",;:":
-                        wt += 2
-                    elif w[-1] in ".?!":
-                        wt += 3
-                weights.append(wt)
-            tot = float(sum(weights))
-            t0 = sc["start"] + st["start"]
-            starts, acc = [], 0.0
-            for wt in weights:
-                starts.append(t0 + st["dur"] * acc / tot)
-                acc += wt
-            g = n if mode == "sentence" else int(mode)
-            groups = [(i, min(n, i + g)) for i in range(0, n, g)]
-            for gi, (a, b) in enumerate(groups):
-                s = starts[a]
-                e = starts[groups[gi + 1][0]] if gi + 1 < len(groups) else t0 + st["dur"] + 0.12
-                if e - s < 0.12:
-                    e = s + 0.12
-                cues.append((s, e, " ".join(words[a:b])))
-    return cues
-
-
-def stage_subtitles(cfg, P, state, fp):
-    scenes = state["scenes"]
-    cues = build_cues(scenes, cfg.subtitle_mode)
-    # integrity: every narrated word must appear exactly once and in order
-    spoken = " ".join(sc["narration"] for sc in scenes).split()
-    shown = " ".join(c[2] for c in cues).split()
-    if spoken != shown:
-        raise PipelineError("Subtitle integrity check failed (words missing or reordered)")
-    srt = []
-    for i, (s, e, tx) in enumerate(cues, start=1):
-        srt.append(f"{i}\n{srt_time(s)} --> {srt_time(e)}\n{tx.upper()}\n")
-    (P.subs / "subs.srt").write_text("\n".join(srt), encoding="utf-8")
-    font_name = "DejaVu Sans"
-    if fp and Path(fp).exists():
-        shutil.copy(fp, P.fonts / Path(fp).name)
-        font_name = "Permanent Marker" if "marker" in Path(fp).name.lower() else ("DejaVu Sans" if "dejavu" in Path(fp).name.lower() else Path(fp).stem)
-    H, W = cfg.H, cfg.W
-    size = int(H * 0.085)
-    hdr = ("[Script Info]\nScriptType: v4.00+\nPlayResX: %d\nPlayResY: %d\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n"
-           "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
-           "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
-           "MarginR, MarginV, Encoding\n"
-           "Style: Default,%s,%d,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,%d,%d,2,%d,%d,%d,1\n\n"
-           "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-           % (W, H, font_name, size, max(3, size // 10), max(1, size // 25), int(W * 0.06), int(W * 0.06), int(H * 0.07)))
-    lines = [hdr]
-    for s, e, tx in cues:
-        tx = tx.upper().replace("\\", "").replace("{", "").replace("}", "")
-        lines.append(f"Dialogue: 0,{ass_time(s)},{ass_time(e)},Default,,0,0,0,,{tx}\n")
-    (P.subs / "subs.ass").write_text("".join(lines), encoding="utf-8")
-    log(f"Subtitles: {len(cues)} cues in mode '{cfg.subtitle_mode}'")
-    mark(P, state, "subtitles", cue_count=len(cues))
-
-
-# --------------------------------------------------------------------------- stage 8: thumbnail
-HOOK_TABLE = [("inflation", "STOLEN?"), ("bank", "BANK CRASH?"), ("debt", "DEBT TRAP!"), ("gold", "GOLD LIES?"),
-              ("crash", "IT CRASHED!"), ("central", "WHO PRINTS IT?"), ("money", "YOUR MONEY?"),
-              ("interest", "HIDDEN COST?"), ("tax", "WHO PAYS?"), ("saving", "SAFE?"), ("housing", "TRAPPED?")]
-THUMB_STYLES = [
-    {"fill": (255, 221, 0), "stroke": (0, 0, 0), "band": None},
-    {"fill": (255, 255, 255), "stroke": (200, 20, 20), "band": (0, 0, 0, 150)},
-    {"fill": (255, 85, 60), "stroke": (255, 255, 255), "band": None},
-    {"fill": (120, 255, 140), "stroke": (0, 0, 0), "band": (0, 0, 0, 120)},
-    {"fill": (255, 221, 0), "stroke": (30, 30, 130), "band": None},
-]
-
-
-def thumbnail_hook(cfg, llm, rng):
-    t = cfg.topic.lower()
-    cands = []
-    if not cfg.smoke:
-        try:
-            txt = llm.generate(
-                f"Write 6 different punchy YouTube thumbnail hooks (1 to 3 words each, ALL CAPS, may end with ? or !) for a calm "
-                f"educational finance video titled '{cfg.topic}'. No numbers, no promises of profit. One hook per line, no numbering.",
-                "You write punchy thumbnail text.", num_predict=70, temperature=0.9, tries=2)
-            for ln in txt.splitlines():
-                ln = re.sub(r"^\s*(?:[-*•]|\d{1,2}[.)])\s*", "", ln)
-                ln = re.sub(r"[^A-Za-z0-9 ?!']", "", ln).strip().upper()
-                if 1 <= len(ln.split()) <= 3 and 3 <= len(ln) <= 20 and not re.search(r"\d|GUARANTEE|GET RICH|PROFIT", ln):
-                    cands.append(ln)
-        except Exception:
-            pass
-    for k, v in HOOK_TABLE:
-        if k in t:
-            cands.append(v)
-    if not cands:
-        cands = [" ".join(cfg.topic.upper().split()[:3])[:20] or "WAIT... WHAT?"]
-    return rng.choice(cands)
-
-
-def stage_thumbnail(cfg, P, state, llm, fp):
-    rng = random.Random(state["seed"] + 31337)  # different layout / colours / crop for every run
-    scenes = state["scenes"]
-    pool = [s for s in scenes if s.get("image_source") == "sd"] or scenes
-    dramatic = [s for s in pool if s["analysis"]["mood"] == "orange" or s["analysis"]["fill"] == "red"]
-    pick = rng.choice(dramatic or pool)
-    base = Image.open(pick["image"]).convert("RGB")
-    W, H = 1280, 720
-    scale = max(W / base.width, H / base.height) * rng.uniform(1.0, 1.3)
-    base = base.resize((int(base.width * scale) + 1, int(base.height * scale) + 1), Image.LANCZOS)
-    l = int((base.width - W) * rng.uniform(0.2, 0.8))
-    t = int((base.height - H) * rng.uniform(0.2, 0.8))
-    img = base.crop((l, t, l + W, t + H)).convert("RGBA")
-    style = rng.choice(THUMB_STYLES)
-    layout = rng.choice(["left", "right", "top", "bottom"])
-    hook = thumbnail_hook(cfg, llm, rng)
-    words = hook.split()
-    lines = words if len(words) <= 2 else [" ".join(words[:2]), " ".join(words[2:])]
-    tmp = ImageDraw.Draw(img)
-    max_w = (W - 160) if layout in ("top", "bottom") else int(W * 0.58)
-    size = 200
-    while size > 60:
-        f = load_font(fp, size)
-        sw = max(4, size // 12)
-        bw = max(tmp.textbbox((0, 0), ln, font=f, stroke_width=sw)[2] for ln in lines)
-        if bw <= max_w and len(lines) * size * 1.1 <= H * 0.55:
-            break
-        size -= 8
-    f = load_font(fp, size)
-    sw = max(4, size // 12)
-    bw = max(tmp.textbbox((0, 0), ln, font=f, stroke_width=sw)[2] for ln in lines)
-    bh = int(len(lines) * size * 1.1)
-    x = {"left": 70, "right": W - 70 - bw, "top": (W - bw) // 2, "bottom": (W - bw) // 2}[layout]
-    y = {"left": (H - bh) // 2, "right": (H - bh) // 2, "top": 40, "bottom": H - bh - 50}[layout]
-    if style["band"]:
-        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        ImageDraw.Draw(ov).rounded_rectangle([x - 30, y - 15, x + bw + 30, y + bh + 15], radius=30, fill=style["band"])
-        img = Image.alpha_composite(img, ov)
-    d = ImageDraw.Draw(img)
-    yy = y
-    for ln in lines:
-        d.text((x, yy), ln, font=f, fill=style["fill"], stroke_width=sw, stroke_fill=style["stroke"])
-        yy += int(size * 1.1)
-    if rng.random() < 0.55:  # big arrow pointing from the text toward the picture
-        sx = x + bw + 15 if layout == "left" else (x - 15 if layout == "right" else W // 2)
-        sy = y + bh // 2 if layout in ("left", "right") else (y + bh + 15 if layout == "top" else y - 15)
-        ex = int(W * (0.72 if layout == "left" else 0.28)) if layout in ("left", "right") else W // 2 + rng.choice([-250, 250])
-        ey = H // 2 if layout in ("left", "right") else (int(H * 0.62) if layout == "top" else int(H * 0.38))
-        if math.hypot(ex - sx, ey - sy) > 120:
-            draw_arrow(d, (sx, sy), (ex, ey), (230, 30, 30), 16)
-    d.rectangle([0, 0, W - 1, H - 1], outline=rng.choice([(0, 0, 0), (255, 255, 255)]), width=10)
-    out = P.proj / "thumbnail.png"
-    img.convert("RGB").save(out)
-    log(f"Thumbnail: '{hook}' (layout {layout}, scene {pick['id']})")
-    mark(P, state, "thumbnail", thumbnail_text=hook)
-
-
-# --------------------------------------------------------------------------- topic choice, SEO, history
-BUILTIN_TOPICS = [
-    "Why Inflation Steals Your Wealth", "How Central Banks Control Money", "How Banks Create Money From Nothing",
-    "What Really Happens In A Bank Run", "Why Your Savings Lose Value Every Year", "How Interest Rates Move The Whole Economy",
-    "The Hidden Cost Of Credit Card Debt", "How Compound Interest Works For And Against You", "Why Houses Became So Expensive",
-    "What A Recession Actually Is", "How Hyperinflation Destroys A Currency", "The Story Of The Gold Standard",
-    "How The Stock Market Really Works", "Why Stock Market Bubbles Keep Happening", "What Is The Federal Reserve And What Does It Do",
-    "How Taxes Quietly Shape Your Paycheck", "Why Prices Never Go Back Down", "How Money Evolved From Barter To Bitcoin",
-    "The Real Reason Banks Charge Overdraft Fees", "How Mortgages Really Work", "What Happens When A Country Defaults On Its Debt",
-    "Why Some Countries Print Money And Others Cannot", "How Index Funds Changed Investing", "What Is Quantitative Easing In Plain English",
-    "How Credit Scores Control Your Life", "The Hidden Machinery Behind Every Card Payment", "Why The Rich Get Richer Faster",
-    "How Insurance Companies Make Money", "What Is Fractional Reserve Banking", "How Exchange Rates Decide What You Pay",
-    "The 2008 Financial Crisis Explained Simply", "Why Student Loans Grew So Large", "How Supply And Demand Set Every Price",
-    "What Is Opportunity Cost And Why It Rules Your Choices", "How Pensions Work And Why They Struggle",
-    "Why Banks Fail And Who Pays", "How Governments Borrow Money", "What Is Stagflation And Why Is It So Feared",
-    "How Currency Collapses Begin", "Why Your Rent Keeps Going Up", "How Gold Became Money", "The Psychology Behind Money Mistakes",
-    "How Venture Capital And Startups Really Work", "Why The Dollar Is Used Around The World", "How Wages And Prices Chase Each Other",
-    "What Is A Budget Deficit And Why Does It Matter", "How Dividends And Buybacks Actually Work", "The Truth About Get Rich Quick Schemes",
-    "How Trade And Tariffs Change What You Pay", "What Is An Emergency Fund And Why It Works",
-]
-STOPWORDS = {"the", "a", "an", "and", "of", "to", "in", "on", "for", "is", "are", "why", "how", "what", "your", "you", "it",
-             "that", "this", "with", "does", "do", "its", "from", "real", "really", "explained", "simply"}
-
-
-def topic_tokens(s):
-    return {w for w in re.findall(r"[a-z0-9]+", s.lower()) if w not in STOPWORDS and len(w) > 2}
-
-
-def too_similar(a, b):
-    ta, tb = topic_tokens(a), topic_tokens(b)
-    if not ta or not tb:
-        return a.lower() == b.lower()
-    return len(ta & tb) / len(ta | tb) >= 0.6
-
-
-def choose_topic(cfg, llm, history):
-    rng = random.Random()  # truly random every run
-    used = [h.get("topic", "") for h in history if isinstance(h, dict)]
-    ideas = []
-    if not cfg.smoke:
-        try:
-            txt = llm.generate(
-                "Suggest 12 distinct YouTube video topics for a calm, educational channel about macroeconomics, personal finance, "
-                "market history and how money mechanics work (banking, inflation, currencies, debt, investing basics). "
-                "Each topic is a short title of 4 to 9 words that sparks curiosity. One per line, no numbering, no extra text. "
-                + (f"Avoid these already-made topics: {'; '.join(used[-15:])}." if used else ""),
-                "You are a creative YouTube strategist for an educational finance channel.", num_predict=260, temperature=1.0, tries=2)
-            for ln in txt.splitlines():
-                ln = re.sub(r"^\s*(?:[-*•]|\d{1,2}[.)])\s*", "", ln).strip().strip('"*')
-                ln = re.sub(r"[^A-Za-z0-9 ,'\-?]", "", ln).strip()
-                if 3 <= len(ln.split()) <= 11 and 15 <= len(ln) <= 80:
-                    ideas.append(ln)
-        except Exception as e:  # noqa: BLE001
-            warn(f"Topic brainstorm failed, using the built-in topic list: {str(e)[:100]}")
-    fresh = [t for t in ideas + BUILTIN_TOPICS if not any(too_similar(t, u) for u in used)]
-    if fresh:
-        # half the time prefer the fresh AI idea, otherwise a curated topic
-        ai = [t for t in fresh if t in ideas]
-        cur = [t for t in fresh if t in BUILTIN_TOPICS]
-        pool = ai if (ai and (not cur or rng.random() < 0.5)) else (cur or fresh)
-        return rng.choice(pool)
-    warn("Every known topic was already used - re-using the one made longest ago")
-    order = {u: i for i, u in enumerate(used)}
-    return min(BUILTIN_TOPICS, key=lambda t: order.get(t, -1))
-
-
-def record_topic(cfg, state, history, pend_path):
-    entry = {"topic": cfg.topic, "title": (state.get("seo") or {}).get("title"),
-             "date": time.strftime("%Y-%m-%d"), "minutes": cfg.minutes}
+def local_text_model() -> tuple[Any, Any, Any] | tuple[None, None, None]:
     try:
-        history = [h for h in history if isinstance(h, dict)] + [entry]
-        save_json(cfg.topic_history, history[-500:])
-        if cfg.auto_topic:
-            save_json(pend_path, {"topic": cfg.topic, "minutes": cfg.minutes, "done": True})
-    except Exception as e:  # noqa: BLE001
-        warn(f"Could not update topic history: {e}")
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        torch.set_num_threads(max(1, min(2, os.cpu_count() or 1)))
+        log(f"Loading local text model: {TEXT_MODEL_ID}")
+        tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_ID, trust_remote_code=False)
+        model = AutoModelForCausalLM.from_pretrained(
+            TEXT_MODEL_ID,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+            trust_remote_code=False,
+        )
+        model.to("cpu")
+        model.eval()
+        return torch, tokenizer, model
+    except Exception as exc:
+        log(f"Local text model unavailable; using built-in finance-writing framework instead: {exc}")
+        return None, None, None
 
 
-def fmt_ts(t):
-    t = int(t)
-    return f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60}:{t % 60:02d}"
+def ask_local_writer(torch: Any, tokenizer: Any, model: Any, prompt: str, max_new_tokens: int) -> str:
+    messages = [
+        {"role": "system", "content": "You write careful, engaging financial-education documentaries. Avoid fabricated statistics, guaranteed returns, stock picks, and personalized financial advice. Use direct second-person narration, natural spoken English, and complete sentences. Do not use lists."},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        encoded = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
+        attention_mask = torch.ones_like(encoded)
+        with torch.inference_mode():
+            generated = model.generate(
+                input_ids=encoded,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.78,
+                top_p=0.9,
+                repetition_penalty=1.12,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+        text = tokenizer.decode(generated[0][encoded.shape[-1]:], skip_special_tokens=True)
+        return normalize_text(text)
+    except Exception as exc:
+        log(f"Chapter generation failed and will use the built-in writer for this chapter: {exc}")
+        return ""
 
 
-def build_chapters(scenes):
-    chap, last_sec = [], None
-    for sc in scenes:
-        sec = sc["section"]
-        if sec == last_sec:
-            continue
-        last_sec = sec
-        title = sec
-        if not chap:
-            title = "Intro"
-        elif sec.lower().startswith("modern mirror"):
-            title = "What this means for you"
-        title = re.sub(r"^The hook:.*", "Intro", title)[:60]
-        if chap and sc["start"] - chap[-1][0] < 10:
-            continue
-        chap.append((sc["start"], title))
-    return chap if len(chap) >= 3 else []
+def fallback_sentences(topic: str, chapter_title: str, chapter_index: int) -> list[str]:
+    sentences: list[str] = []
+    for offset, pattern in enumerate(FALLBACK_SENTENCE_PATTERNS):
+        sentence = pattern.format(topic=topic, chapter_title=chapter_title)
+        if offset % 5 == 0:
+            sentence = sentence.replace("the decision", f"the decision in {chapter_title.lower()}")
+        if offset % 7 == 0:
+            sentence += f" In this chapter, you are examining {chapter_title.lower()}, not searching for a shortcut."
+        sentences.append(sentence)
+    # Chapter-specific analytical bridge makes fallback passages less generic.
+    bridges = [
+        f"For {chapter_title.lower()}, the practical test is to ask what the choice changes today and what it commits you to tomorrow.",
+        f"Return to {topic.lower()} and compare a best-case story with a less comfortable but plausible scenario.",
+        "A sound decision should remain understandable after the excitement of the moment has passed.",
+        "Write down the assumption that matters most, then ask how the result changes when that assumption is wrong.",
+        "You do not need a perfect forecast to notice a fee, a recurring obligation, or a risk you cannot afford.",
+        "The useful habit is to review the evidence, make one deliberate choice, and measure the result without shaming yourself.",
+        "When two options look similar, preserving liquidity and flexibility may matter more than optimizing a spreadsheet by a tiny amount.",
+        "This is why a personal plan must fit your actual responsibilities rather than an idealized example from the internet.",
+    ]
+    sentences.extend(bridges)
+    random.Random(chapter_index + len(topic)).shuffle(sentences)
+    return sentences
 
 
-def score_title(t, kw):
-    n, s = len(t), 0
-    s += 3 if 35 <= n <= 65 else (1 if n <= 70 else -3)
-    s += min(3, sum(1 for k in kw if k in t.lower()))
-    if re.search(r"\b(why|how|what|secret|hidden|really|actually|truth|nobody|explained|machinery)\b", t, re.I):
-        s += 1
-    if re.search(r"guarantee|get rich|millionaire|100%|free money|!!!", t, re.I):
-        s -= 5
-    if sum(1 for c in t if c.isupper()) / max(1, n) > 0.5:
-        s -= 3
-    return s
+def fit_chapter(text: str, topic: str, title: str, index: int, target_words: int) -> str:
+    candidate = split_sentences(text)
+    fillers = fallback_sentences(topic, title, index)
+    filler_idx = 0
+    current_words = sum(word_count(s) for s in candidate)
+    while current_words < target_words:
+        sentence = fillers[filler_idx % len(fillers)]
+        filler_idx += 1
+        candidate.append(sentence)
+        current_words += word_count(sentence)
+    # Keep complete sentences where possible; one final sentence can put the chapter a little over target.
+    kept: list[str] = []
+    total = 0
+    for sentence in candidate:
+        size = word_count(sentence)
+        if total >= target_words and total + size > target_words + 14:
+            break
+        kept.append(sentence)
+        total += size
+        if total >= target_words:
+            break
+    while total < target_words:
+        sentence = fillers[filler_idx % len(fillers)]
+        filler_idx += 1
+        needed = target_words - total
+        tokens = sentence.split()
+        if len(tokens) > needed and needed >= 7:
+            sentence = " ".join(tokens[:needed]).rstrip(",;:") + "."
+        kept.append(sentence)
+        total += word_count(sentence)
+    return " ".join(kept)
 
 
-def clip_words(t, n):
-    if len(t) <= n:
-        return t
-    return t[:n].rsplit(" ", 1)[0].rstrip(",:;-")
-
-
-def stage_seo(cfg, P, state, llm):
-    """Title, description (with chapters), tags. Written for search + click-through, without false promises."""
-    rng = random.Random(state["seed"] + 4242)
-    topic = cfg.topic
-    kw = sorted(topic_tokens(topic))
-    cands = []
-    if not cfg.smoke:
-        try:
-            txt = llm.generate(
-                f"Write 6 different YouTube titles (35 to 62 characters each) for an educational doodle-animation video about: {topic}. "
-                "Use curiosity and plain words, include the main topic keyword, no clickbait lies, no ALL CAPS shouting, no promises of profit. "
-                "One title per line, no numbering, no quotes.", "You are a YouTube title writer for an educational finance channel.",
-                num_predict=140, temperature=0.9, tries=2)
-            for ln in txt.splitlines():
-                ln = re.sub(r"^\s*(?:[-*•]|\d{1,2}[.)])\s*", "", ln).strip().strip('"*')
-                ln = re.sub(r"[^A-Za-z0-9 ,:'\-?!]", "", ln).strip()
-                if 4 <= len(ln.split()) <= 13:
-                    cands.append(clip_words(ln, 70))
-        except Exception as e:  # noqa: BLE001
-            warn(f"SEO title brainstorm failed, using templates: {str(e)[:100]}")
-    T = topic.strip().rstrip("?.")
-    cands += [clip_words(x, 70) for x in (
-        f"{T}: What Nobody Explains", f"The Hidden Machinery Behind {T}", f"{T} Explained Simply",
-        f"{T} (And What It Means For Your Wallet)", f"The Truth About {T}")]
-    scored = sorted(((score_title(c, kw), c) for c in cands), key=lambda x: -x[0])
-    best = scored[0][0]
-    title = rng.choice([c for s, c in scored if s >= best - 1][:3])
-    desc_hook = None
-    if not cfg.smoke:
-        try:
-            desc_hook = llm.generate(
-                f"Write a 2 sentence YouTube description opening for an educational doodle video titled '{title}' about {topic}. "
-                "Plain words, second person, no promises, no hashtags. Output only the two sentences.",
-                "You write concise YouTube descriptions.", num_predict=90, temperature=0.7, tries=2)
-            desc_hook = " ".join(split_sentences(clean_narration(desc_hook))[:2])
-        except Exception:
-            desc_hook = None
-    if not desc_hook or len(desc_hook.split()) < 8:
-        desc_hook = (f"{T}, explained with simple hand-drawn doodles. In plain English, you will see how it actually works "
-                     "and how it quietly touches your own money.")
-    chapters = build_chapters(state["scenes"])
-    tag_pool = [topic.lower(), "personal finance", "economics", "money explained", "how money works", "financial education",
-                "doodle animation", "whiteboard animation", "macroeconomics", "finance for beginners"] + kw
-    tags, total_len = [], 0
-    for tg in tag_pool:
-        tg = tg.strip()
-        if tg and tg not in tags and total_len + len(tg) + 1 <= 450:
-            tags.append(tg)
-            total_len += len(tg) + 1
-    ordered = [w for w in re.findall(r"[a-z0-9]+", topic.lower()) if w in kw and not w.endswith("ly")]
-    ordered = list(dict.fromkeys(sorted(ordered, key=len, reverse=True)))[:2]
-    hashtags = " ".join("#" + w for w in ordered + ["finance", "economics"])
-    description = desc_hook + "\n\n"
-    if chapters:
-        description += "\n".join(f"{fmt_ts(t)} {name}" for t, name in chapters) + "\n\n"
-    description += ("This video is for education only and is not financial advice. "
-                    "Always do your own research or speak to a qualified professional.\n\n" + hashtags)
-    seo = {"title": title, "description": description, "tags": tags, "thumbnail_text": state.get("thumbnail_text"),
-           "alternative_titles": [c for s, c in scored[:5] if c != title]}
-    state["seo"] = seo
-    slug = state["slug"]
-    save_json(P.out / f"{slug}_seo.json", seo)
-    (P.out / f"{slug}_seo.txt").write_text(
-        f"TITLE:\n{title}\n\nTHUMBNAIL TEXT:\n{seo['thumbnail_text']}\n\nDESCRIPTION:\n{description}\n\nTAGS:\n{', '.join(tags)}\n",
-        encoding="utf-8")
-    log(f"SEO title: {title}")
-    if not cfg.smoke:
-        llm.unload()
-    mark(P, state, "seo", seo=seo)
-
-
-# --------------------------------------------------------------------------- stage 9: render
-EFFECTS_ALL = ["zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down", "zoom_pan", "track"]
-INTENSITY_K = {"subtle": 0.06, "medium": 0.12, "strong": 0.22}
-
-
-def effect_params(name, k, rng):
-    if name == "static":
-        return dict(z0=1.0, z1=1.0, fx0=.5, fx1=.5, fy0=.5, fy1=.5)
-    c = dict(fx0=.5, fx1=.5, fy0=.5, fy1=.5)
-    if name == "zoom_in":
-        return dict(z0=1.0, z1=1 + k, **c)
-    if name == "zoom_out":
-        return dict(z0=1 + k, z1=1.0, **c)
-    z = 1 + k
-    if name == "pan_left":
-        return dict(z0=z, z1=z, fx0=1.0, fx1=0.0, fy0=.5, fy1=.5)
-    if name == "pan_right":
-        return dict(z0=z, z1=z, fx0=0.0, fx1=1.0, fy0=.5, fy1=.5)
-    if name == "pan_up":
-        return dict(z0=z, z1=z, fx0=.5, fx1=.5, fy0=1.0, fy1=0.0)
-    if name == "pan_down":
-        return dict(z0=z, z1=z, fx0=.5, fx1=.5, fy0=0.0, fy1=1.0)
-    if name == "zoom_pan":
-        a, b = (0.2, 0.8) if rng.random() < 0.5 else (0.8, 0.2)
-        return dict(z0=1.0, z1=z, fx0=a, fx1=b, fy0=.35, fy1=.65)
-    a, b = (0.0, 1.0) if rng.random() < 0.5 else (1.0, 0.0)  # tracking shot
-    return dict(z0=1 + 0.8 * k, z1=1 + k, fx0=a, fx1=b, fy0=.55, fy1=.45)
-
-
-def choose_effects(cfg, scenes, rng):
-    k = INTENSITY_K[cfg.intensity]
-    if cfg.animation == "off":
-        pool = ["static"]
-    elif cfg.animation == "minimal":
-        pool, k = ["zoom_in", "zoom_out"], k * 0.6
-    elif cfg.animation == "cinematic":
-        pool, k = ["zoom_in", "zoom_out", "track", "zoom_pan", "pan_left", "pan_right"], k * 1.25
+def generate_script(topic: str, test_run: bool) -> dict[str, Any]:
+    torch, tokenizer, model = local_text_model()
+    chapters: list[dict[str, Any]] = []
+    if test_run:
+        title = "A One-Minute Money Lesson"
+        prompt = (
+            f"Write about 145 words for a one-minute stickman finance documentary about {topic}. "
+            "Open with a vivid everyday money moment, explain one mechanism, and finish with one practical question. "
+            "Use second-person 'you', natural spoken English, no headings, no bullet points, no fabricated statistics."
+        )
+        generated = ask_local_writer(torch, tokenizer, model, prompt, 250) if model is not None else ""
+        text = fit_chapter(generated, topic, title, 0, 135)
+        chapters.append({"title": title, "text": text})
     else:
-        pool = EFFECTS_ALL
-    prev = None
-    for sc in scenes:
-        opts = [p for p in pool if p != prev] if (len(pool) > 1 and not cfg.no_avoid_repeat) else pool
-        name = rng.choice(opts)
-        prev = name
-        sc["animation"] = name
-        sc["animation_params"] = effect_params(name, k, rng)
+        for index, (title, angle) in enumerate(CHAPTER_SPECS):
+            prompt = (
+                f"Write approximately 365 words for chapter {index + 1} of a 12-chapter finance documentary.\n"
+                f"Main topic: {topic}.\nChapter title: {title}.\nChapter focus: {angle}\n"
+                "Use natural, engaging, second-person narration addressed to 'you'. Include a concrete everyday example, explain the financial mechanism, and identify a limitation or risk. "
+                "Use complete spoken sentences and paragraphs, no title, no bullets, no numbered list, no markdown. "
+                "Do not invent statistics, present projections as guarantees, recommend specific securities, or claim that a tactic always works. Avoid repeating the chapter opening."
+            )
+            generated = ask_local_writer(torch, tokenizer, model, prompt, 650) if model is not None else ""
+            text = fit_chapter(generated, topic, title, index, 365)
+            chapters.append({"title": title, "text": text})
+            log(f"Prepared chapter {index + 1}/{len(CHAPTER_SPECS)} ({word_count(text)} words): {title}")
+    if model is not None:
+        del model, tokenizer, torch
+        gc.collect()
+    full_text = "\n\n".join(f"{chapter['title']}.\n{chapter['text']}" for chapter in chapters)
+    return {"topic": topic, "chapters": chapters, "script_text": full_text, "word_count": word_count(full_text)}
 
 
-def choose_transitions(cfg, scenes, rng, xfade_ok):
-    mode = cfg.transition
-    if not xfade_ok and mode not in ("cut", "off"):
-        warn("This FFmpeg has no 'xfade' filter - falling back to direct cuts")
-        mode = "cut"
-    if mode in ("cut", "off"):
-        pool = ["cut"]
-    elif mode == "crossfade":
-        pool = ["fade"]
-    elif mode == "cinematic":
-        pool = ["fade", "fadeblack", "dissolve"]
-    else:
-        pool = ["fade", "dissolve", "fadeblack", "slideleft", "slideright", "fade", "dissolve", "cut"]
-    prev = None
-    for i, sc in enumerate(scenes):
-        if i == len(scenes) - 1:
-            sc["transition_out"] = "none"
-            continue
-        opts = [p for p in pool if p != prev] if (len(set(pool)) > 1 and not cfg.no_avoid_repeat) else pool
-        name = rng.choice(opts)
-        prev = name
-        sc["transition_out"] = name
+def flatten_sentences(script_data: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for chapter_index, chapter in enumerate(script_data["chapters"]):
+        for sentence in split_sentences(chapter["text"]):
+            result.append({"chapter_index": chapter_index, "chapter_title": chapter["title"], "text": sentence})
+    return result
 
 
-def motion_chain(eff, c, dur, fps, W, H, d_frames):
-    P_ = f"min(1,max(0,({c:.6f}+on/{fps})/{dur:.6f}))"
-    z = f"({eff['z0']:.4f}+({eff['z1']:.4f}-{eff['z0']:.4f})*{P_})"
-    x = f"(iw-iw/{z})*({eff['fx0']:.4f}+({eff['fx1']:.4f}-{eff['fx0']:.4f})*{P_})"
-    y = f"(ih-ih/{z})*({eff['fy0']:.4f}+({eff['fy1']:.4f}-{eff['fy0']:.4f})*{P_})"
-    W2, H2 = even(W * 1.5), even(H * 1.5)
-    return (f"scale={W2}:{H2}:force_original_aspect_ratio=increase:flags=lanczos,crop={W2}:{H2},"
-            f"zoompan=z='{z}':x='{x}':y='{y}':d={d_frames}:s={W}x{H}:fps={fps},format=yuv420p")
+def audio_array_from_kokoro(kpipeline: Any, sentence: str) -> np.ndarray:
+    chunks: list[np.ndarray] = []
+    for item in kpipeline(sentence, voice=VOICE_NAME, speed=1.0):
+        audio = item[2] if isinstance(item, (tuple, list)) and len(item) >= 3 else item
+        if hasattr(audio, "detach"):
+            audio = audio.detach().cpu().numpy()
+        array = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if array.size:
+            chunks.append(array)
+    if not chunks:
+        raise RuntimeError(f"Kokoro returned no audio for sentence: {sentence[:90]}")
+    return np.concatenate(chunks).astype(np.float32, copy=False)
 
 
-def enc_args(fps):
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-bf", "0",
-            "-g", str(fps * 2), "-threads", "2", "-an", "-movflags", "+faststart"]
+def atempo_chain(speed: float) -> str:
+    # FFmpeg atempo supports 0.5..2.0 per stage; chain factors if necessary.
+    factors: list[float] = []
+    remaining = speed
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(remaining)
+    return ",".join(f"atempo={factor:.8f}" for factor in factors)
 
 
-def render_body(cfg, sc, f0, n, out):
-    fps = cfg.fps
-    c = f0 / fps - sc["start"]
-    vf = motion_chain(sc["animation_params"], c, sc["duration"], fps, cfg.W, cfg.H, n)
-    run([FFMPEG, "-y", "-v", "error", "-i", sc["image"], "-vf", vf, "-frames:v", n] + enc_args(fps) + [out], timeout=900)
+def generate_narration(script_data: dict[str, Any], target_duration: float) -> list[dict[str, Any]]:
+    audio_dir = WORK / "audio"
+    segment_dir = audio_dir / "segments"
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    narration_path = audio_dir / "narration.wav"
+    timing_path = WORK / "sentence_timings.json"
+    state = load_json(CHECKPOINT, {}) or {}
+    if narration_path.exists() and timing_path.exists() and state.get("stage") in {"audio_generating", "audio_ready", "images_generating", "images_ready", "clips_generating", "clips_ready", "rendered"}:
+        log("Reusing completed narration and sentence timings from checkpoint.")
+        return load_json(timing_path, [])
 
+    try:
+        import torch
+        from kokoro import KPipeline
+        torch.set_num_threads(max(1, min(2, os.cpu_count() or 1)))
+        log("Loading local Kokoro-82M voice engine.")
+        kpipeline = KPipeline(lang_code="a")
+    except Exception as exc:
+        raise RuntimeError(f"Could not initialize Kokoro local TTS. Ensure kokoro, misaki[en], espeak-ng and model downloads are available: {exc}") from exc
 
-def render_bridge(cfg, a, b, f0, n, name, out):
-    fps = cfg.fps
-    ca = motion_chain(a["animation_params"], f0 / fps - a["start"], a["duration"], fps, cfg.W, cfg.H, n + 1)
-    cb = motion_chain(b["animation_params"], f0 / fps - b["start"], b["duration"], fps, cfg.W, cfg.H, n + 1)
-    fc = (f"[0:v]{ca}[a];[1:v]{cb}[b];[a][b]xfade=transition={name}:duration={n / fps:.4f}:offset=0,format=yuv420p[v]")
-    run([FFMPEG, "-y", "-v", "error", "-i", a["image"], "-i", b["image"], "-filter_complex", fc, "-map", "[v]",
-         "-frames:v", n] + enc_args(fps) + [out], timeout=900)
-
-
-def plan_render(cfg, scenes, total):
-    fps = cfg.fps
-    F = lambda t: int(round(t * fps))  # noqa: E731
-    total_frames = F(total)
-    pieces, cursor, n = [], 0, len(scenes)
-    for i, sc in enumerate(scenes):
-        if i < n - 1:
-            nxt = scenes[i + 1]
-            B = sc["end"]
-            name = sc.get("transition_out", "cut")
-            h = min(cfg.transition_seconds / 2.0, 0.4 * sc["duration"], 0.4 * nxt["duration"])
-            bf0, bf1 = F(B - h), F(B + h)
-            if name != "cut" and bf1 - bf0 >= 2 and bf0 >= cursor:
-                if bf0 > cursor:
-                    pieces.append({"type": "body", "scene": i, "f0": cursor, "n": bf0 - cursor})
-                pieces.append({"type": "bridge", "a": i, "b": i + 1, "f0": bf0, "n": bf1 - bf0, "name": name})
-                cursor = bf1
+    sentences = flatten_sentences(script_data)
+    pad_samples = int(0.25 * SAMPLE_RATE)
+    pad = np.zeros(pad_samples, dtype=np.float32)
+    segment_arrays: list[np.ndarray] = []
+    timings_raw: list[dict[str, Any]] = []
+    sample_cursor = 0
+    for index, item in enumerate(sentences):
+        segment_path = segment_dir / f"sentence_{index:05d}.wav"
+        if segment_path.exists():
+            audio, sr = sf.read(segment_path, dtype="float32", always_2d=False)
+            if sr != SAMPLE_RATE:
+                segment_path.unlink(missing_ok=True)
+                audio = audio_array_from_kokoro(kpipeline, item["text"])
+                sf.write(segment_path, audio, SAMPLE_RATE, subtype="PCM_16")
             else:
-                sc["transition_out"] = "cut"
-                end = F(B)
-                if end > cursor:
-                    pieces.append({"type": "body", "scene": i, "f0": cursor, "n": end - cursor})
-                    cursor = end
+                audio = np.asarray(audio, dtype=np.float32).reshape(-1)
         else:
-            if total_frames > cursor:
-                pieces.append({"type": "body", "scene": i, "f0": cursor, "n": total_frames - cursor})
-                cursor = total_frames
-    return pieces, total_frames
+            audio = audio_array_from_kokoro(kpipeline, item["text"])
+            sf.write(segment_path, audio, SAMPLE_RATE, subtype="PCM_16")
+        segment_arrays.append(audio)
+        start = sample_cursor / SAMPLE_RATE
+        speech_end = (sample_cursor + len(audio)) / SAMPLE_RATE
+        segment_arrays.append(pad)
+        sample_cursor += len(audio) + pad_samples
+        timings_raw.append({
+            "index": index,
+            "chapter_index": item["chapter_index"],
+            "chapter_title": item["chapter_title"],
+            "text": item["text"],
+            "raw_start": start,
+            "raw_speech_end": speech_end,
+            "raw_end": sample_cursor / SAMPLE_RATE,
+            "raw_duration": len(audio) / SAMPLE_RATE + 0.25,
+            "audio_samples": int(len(audio)),
+        })
+        if index % 20 == 0 or index == len(sentences) - 1:
+            log(f"Narration sentence {index + 1}/{len(sentences)}")
+            atomic_json(CHECKPOINT, {**state, "stage": "audio_generating", "audio_sentence_index": index + 1, "sentence_count": len(sentences)})
+        del audio
+        if index % 30 == 0:
+            gc.collect()
 
-
-def stage_render(cfg, P, state):
-    scenes = state["scenes"]
-    total = state["total_seconds"]
-    rng = random.Random(state["seed"])
-    xfade_ok = ffmpeg_has_filter("xfade")
-    choose_effects(cfg, scenes, rng)
-    choose_transitions(cfg, scenes, rng, xfade_ok)
-    pieces, total_frames = plan_render(cfg, scenes, total)
-    sig = hashlib.sha1(json.dumps([pieces, cfg.W, cfg.H, cfg.fps, [(s["animation"], s["animation_params"], s["image"]) for s in scenes]],
-                                  sort_keys=True).encode()).hexdigest()
-    sigf = P.render / "sig.txt"
-    if not (sigf.exists() and sigf.read_text() == sig):
-        shutil.rmtree(P.pieces, ignore_errors=True)
-        P.pieces.mkdir(parents=True, exist_ok=True)
-        sigf.write_text(sig)
-    log(f"Rendering {len(pieces)} clips for {len(scenes)} scenes ({total_frames} frames @ {cfg.fps} fps, {cfg.W}x{cfg.H})")
-    fallback_cuts = []
-
-    def job(idx):
-        pc = pieces[idx]
-        out = P.pieces / f"p_{idx:05d}.mp4"
-        if out.exists() and out.stat().st_size > 500:
-            return idx
-        tmp = P.pieces / f"p_{idx:05d}.part.mp4"
-        if pc["type"] == "body":
-            render_body(cfg, scenes[pc["scene"]], pc["f0"], pc["n"], tmp)
-        else:
-            a, b = scenes[pc["a"]], scenes[pc["b"]]
-            try:
-                render_bridge(cfg, a, b, pc["f0"], pc["n"], pc["name"], tmp)
-            except Exception as e:  # noqa: BLE001
-                warn(f"Transition '{pc['name']}' failed at boundary {a['id']}->{b['id']}, using a direct cut: {str(e)[:150]}")
-                fallback_cuts.append(idx)
-                half = pc["n"] // 2
-                t1, t2 = P.pieces / f"p_{idx:05d}.a.mp4", P.pieces / f"p_{idx:05d}.b.mp4"
-                render_body(cfg, a, pc["f0"], half, t1)
-                render_body(cfg, b, pc["f0"] + half, pc["n"] - half, t2)
-                lst = P.pieces / f"p_{idx:05d}.txt"
-                lst.write_text(f"file '{t1.resolve()}'\nfile '{t2.resolve()}'\n")
-                run([FFMPEG, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", tmp])
-        os.replace(tmp, out)
-        return idx
-
-    workers = max(1, (os.cpu_count() or 2) // 2)
-    done = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(job, i) for i in range(len(pieces))]
-        for f in as_completed(futs):
-            f.result()
-            done += 1
-            if done % 25 == 0 or done == len(pieces):
-                log(f"  clips {done}/{len(pieces)}")
-    lst = P.render / "concat.txt"
-    lst.write_text("".join(f"file '{(P.pieces / f'p_{i:05d}.mp4').resolve()}'\n" for i in range(len(pieces))))
-    raw = P.render / "video_raw.mp4"
-    run([FFMPEG, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", raw], timeout=1800)
-    info = probe(raw)
-    exp = total_frames / cfg.fps
-    log(f"Concatenated visuals: {info['duration']:.2f}s (expected {exp:.2f}s)")
-    state["transition_fallbacks"] = len(fallback_cuts)
-    mark(P, state, "render", total_frames=total_frames)
-    return raw
-
-
-def stage_final(cfg, P, state, raw, slug):
-    total = state["total_seconds"]
-    narr = P.audio / "narration.wav"
-    out_tmp = P.render / "final.mp4"
-    base = ["-y", "-v", "error", "-i", raw.relative_to(P.proj).as_posix(), "-i", narr.relative_to(P.proj).as_posix()]
-    tail = ["-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
-            "-r", str(cfg.fps), "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-movflags", "+faststart",
-            "-t", f"{total:.3f}", out_tmp.relative_to(P.proj).as_posix()]
-    vf_pad = f"tpad=stop_mode=clone:stop_duration=1"  # safety: never let video end before audio
-    burned = True
+    raw_audio_path = audio_dir / "narration_raw.wav"
+    full_audio = np.concatenate(segment_arrays).astype(np.float32, copy=False)
+    sf.write(raw_audio_path, full_audio, SAMPLE_RATE, subtype="PCM_16")
+    raw_duration = len(full_audio) / SAMPLE_RATE
+    del full_audio, segment_arrays, kpipeline
+    gc.collect()
     try:
-        run([FFMPEG] + base + ["-vf", f"{vf_pad},ass=subs/subs.ass:fontsdir=fonts"] + tail, cwd=P.proj, timeout=7200)
-    except PipelineError as e:
-        warn(f"Burning subtitles failed ({str(e)[:200]}). Rendering without burned-in subtitles; SRT/ASS are kept next to the MP4.")
-        burned = False
-        run([FFMPEG] + base + ["-vf", vf_pad] + tail, cwd=P.proj, timeout=7200)
-    info = probe(out_tmp)
-    if not (info["has_video"] and info["has_audio"]):
-        raise PipelineError("Final MP4 is missing a video or audio stream")
-    if abs(info["duration"] - total) > 1.0:
-        raise PipelineError(f"Final duration {info['duration']:.2f}s differs from narration {total:.2f}s")
-    limit = cfg.minutes * 60
-    if info["duration"] > limit + 0.5:
-        warn(f"Final video ({info['duration']:.1f}s) is above the {limit:.0f}s limit")
-    final = P.out / f"{slug}.mp4"
-    shutil.move(str(out_tmp), final)
-    shutil.copy(P.subs / "subs.srt", P.out / f"{slug}.srt")
-    shutil.copy(P.subs / "subs.ass", P.out / f"{slug}.ass")
-    if (P.proj / "thumbnail.png").exists():
-        shutil.copy(P.proj / "thumbnail.png", P.out / f"{slug}_thumbnail.png")
-    if (P.proj / "script.json").exists():
-        shutil.copy(P.proj / "script.json", P.out / f"{slug}_script.json")
-    scenes = state["scenes"]
-    report = {
-        "topic": cfg.topic, "title": (state.get("seo") or {}).get("title") or cfg.topic,
-        "thumbnail_text": state.get("thumbnail_text"), "file": str(final), "size_mb": round(final.stat().st_size / 1e6, 1),
-        "duration_seconds": round(info["duration"], 2), "limit_seconds": limit,
-        "resolution": f"{info['width']}x{info['height']}", "scenes": len(scenes),
-        "images_dreamshaper": sum(1 for s in scenes if s.get("image_source") == "sd"),
-        "images_fallback": sum(1 for s in scenes if s.get("image_source") == "fallback"),
-        "tts_silent_fallbacks": state.get("tts_fallbacks", 0),
-        "transition_fallbacks": state.get("transition_fallbacks", 0),
-        "subtitles_burned": burned, "pipeline_minutes": round((time.time() - T0) / 60, 1),
-        "scene_manifest": [{k: s.get(k) for k in ("id", "start", "end", "duration", "animation", "transition_out", "image", "image_source")}
-                           for s in scenes],
-    }
-    save_json(P.out / f"{slug}_report.json", report)
-    mark(P, state, "final", report={k: v for k, v in report.items() if k != "scene_manifest"})
-    return report
-
-
-# --------------------------------------------------------------------------- main
-def write_summary(report):
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not path:
-        return
-    md = ["## Doodle video finished", "",
-          f"- **YouTube title:** {report.get('title')}",
-          f"- **Topic:** {report['topic']}",
-          f"- **Thumbnail text:** {report.get('thumbnail_text')}",
-          f"- **Length:** {report['duration_seconds'] / 60:.1f} min (limit {report['limit_seconds'] / 60:.0f} min)",
-          f"- **Scenes:** {report['scenes']} (DreamShaper {report['images_dreamshaper']}, fallback {report['images_fallback']})",
-          f"- **Size:** {report['size_mb']} MB, {report['resolution']}",
-          f"- **Pipeline time:** {report['pipeline_minutes']} min", ""]
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\n".join(md) + "\n")
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except Exception:
         pass
 
+    speed = max(0.5, min(2.0, raw_duration / target_duration))
+    scale = 1.0 / speed
+    audio_filter = f"{atempo_chain(speed)},apad=whole_dur={target_duration:.3f},atrim=duration={target_duration:.3f},asetpts=N/SR/TB"
+    run_checked(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw_audio_path), "-af", audio_filter, "-ar", str(SAMPLE_RATE), "-ac", "1", str(narration_path)])
+    raw_audio_path.unlink(missing_ok=True)
 
-def main(argv=None):
-    cfg = parse_args(argv)
-    find_ffmpeg()
-    llm = Ollama(cfg.ollama_url, cfg.ollama_model)
-    if not cfg.smoke:
-        llm.start()
-        llm.ensure_model()
-    history = load_json(cfg.topic_history, []) or []
-    Path(cfg.workdir).mkdir(parents=True, exist_ok=True)
-    pend_path = Path(cfg.workdir) / "_auto_topic.json"
-    if cfg.auto_topic:
-        pend = load_json(pend_path, None)
-        if pend and not pend.get("done") and pend.get("topic") and pend.get("minutes") == cfg.minutes:
-            cfg.topic = pend["topic"]
-            log(f"Resuming auto-selected topic: {cfg.topic}")
+    timings: list[dict[str, Any]] = []
+    for record in timings_raw:
+        start = record["raw_start"] * scale
+        speech_end = record["raw_speech_end"] * scale
+        end = record["raw_end"] * scale
+        # Keep all event positions inside the exact target track duration.
+        start = max(0.0, min(target_duration, start))
+        speech_end = max(start, min(target_duration, speech_end))
+        end = max(speech_end, min(target_duration, end))
+        timings.append({
+            "index": record["index"],
+            "chapter_index": record["chapter_index"],
+            "chapter_title": record["chapter_title"],
+            "text": record["text"],
+            "start_time": round(start, 6),
+            "speech_end_time": round(speech_end, 6),
+            "end_time": round(end, 6),
+            "duration": round(end - start, 6),
+            "audio_samples": record["audio_samples"],
+        })
+    atomic_json(timing_path, timings)
+    shutil.rmtree(segment_dir, ignore_errors=True)
+    atomic_json(CHECKPOINT, {**state, "stage": "audio_ready", "audio_sentence_index": len(sentences), "sentence_count": len(sentences), "narration_seconds": target_duration})
+    log(f"Saved narration.wav at {target_duration:.3f}s; audio timing scale={scale:.5f}.")
+    return timings
+
+
+def visual_description(text: str, topic: str, chapter_title: str, index: int) -> str:
+    blob = f"{text} {topic} {chapter_title}".casefold()
+    choices = [
+        (("debt", "credit", "loan", "interest", "payment"), "a red debt meter, a credit card, red downward arrows, and a worried stickman checking bills"),
+        (("inflation", "price", "cost", "grocery", "rent"), "colorful grocery prices rising beside a rent bill, coins, and a vivid price chart"),
+        (("stock", "market", "share", "invest", "crash", "portfolio"), "a glowing emerald stock chart, colorful candlesticks, gold coins, and a market dashboard"),
+        (("compound", "growth", "time", "interest", "future"), "a staircase of shiny gold coins growing toward an emerald upward graph and a calendar"),
+        (("budget", "spending", "purchase", "shopping", "consumer"), "a colorful shopping cart, a wallet, receipts, and bright comparison price tags"),
+        (("bank", "cash", "saving", "emergency", "reserve"), "a modern colorful bank, a safe, neatly stacked cash, and a glowing green safety shield"),
+        (("asset", "wealth", "net worth", "income", "cash flow"), "colorful asset icons, gold coins, a rising chart, a home, and a simple balance sheet"),
+        (("risk", "uncertainty", "volatility", "diversif", "resilien"), "a balance scale, diversified colorful asset symbols, a safety net, and a choppy market chart"),
+        (("marketing", "status", "social", "brand", "luxury"), "a colorful luxury storefront, a sports car, shopping bags, and a stickman comparing choices"),
+        (("time", "career", "option", "freedom", "choice"), "a vibrant road splitting toward a home, education, free time, and a growing savings jar"),
+    ]
+    for keywords, description in choices:
+        if any(word in blob for word in keywords):
+            return description
+    options = [
+        "a colorful city skyline, glowing green charts, golden coins, and a simple financial decision board",
+        "a bright modern room with bills, savings jars, gold coins, and a rising emerald arrow",
+        "a vibrant financial control panel with colorful graphs, a piggy bank, and a stack of coins",
+        "a colorful crossroads surrounded by financial choices, green charts, and shiny gold coins",
+    ]
+    return options[index % len(options)]
+
+
+def stickman_prompt(description: str, extra: str = "") -> str:
+    return (
+        "2D flat vector financial illustration, a strictly black and white minimalist stickman character, "
+        "pure white head and body fill #FFFFFF, bold clean black ink outlines #000000, no colored skin, "
+        f"surrounded by vibrant colorful {description}, glowing emerald green stock market graphs, shiny gold coins, "
+        "rich colorful modern environment, high contrast, clean vector art, crisp edges, wide 16:9 composition, "
+        "no letters, no logos, no watermark. " + extra
+    )
+
+
+def choose_font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        "/usr/share/fonts/truetype/custom/Anton-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    for candidate in candidates:
+        if Path(candidate).exists():
+            try:
+                return ImageFont.truetype(candidate, size=size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def fallback_vector_art(description: str, seed: int, width: int = 512, height: int = 288) -> Image.Image:
+    rng = random.Random(seed)
+    palettes = [(12, 33, 66), (26, 23, 72), (7, 56, 48), (67, 27, 25), (14, 44, 55)]
+    bg = palettes[seed % len(palettes)]
+    image = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(image)
+    # Glowing atmosphere, skyline, and chart elements.
+    for i in range(13):
+        x = rng.randint(-40, width - 10)
+        y = rng.randint(-30, height - 20)
+        r = rng.randint(15, 65)
+        color = rng.choice([(15, 110, 88), (20, 85, 150), (122, 74, 21), (113, 35, 88), (32, 125, 50)])
+        draw.ellipse((x-r, y-r, x+r, y+r), fill=color)
+    for x in range(0, width, 40):
+        h = rng.randint(35, 95)
+        draw.rectangle((x, height-h, x+25, height), fill=rng.choice([(16, 56, 95), (20, 65, 83), (36, 43, 76)]), outline=(36, 99, 121), width=1)
+        for wy in range(height-h+8, height-5, 12):
+            draw.rectangle((x+5, wy, x+10, wy+4), fill=(240, 180, 55))
+    # Green graph and bright gold objects.
+    points = [(35, 190), (86, 172), (128, 185), (177, 130), (226, 150), (280, 93), (328, 115), (386, 61), (460, 48)]
+    draw.line(points, fill=(38, 255, 111), width=4, joint="curve")
+    for px, py in points[::2]:
+        draw.ellipse((px-4, py-4, px+4, py+4), fill=(255, 245, 110), outline=(0, 0, 0), width=1)
+    for cx, cy, radius in [(width-52, height-49, 19), (width-91, height-41, 15), (width-123, height-32, 12)]:
+        draw.ellipse((cx-radius, cy-radius, cx+radius, cy+radius), fill=(255, 193, 31), outline=(120, 69, 0), width=3)
+        draw.arc((cx-radius+4, cy-radius+4, cx+radius-4, cy+radius-4), 20, 300, fill=(255, 231, 112), width=2)
+    # Minimalist stickman: white fill/body, black outlines only.
+    head_x, head_y = int(width*0.28), int(height*0.42)
+    hr = 25
+    draw.ellipse((head_x-hr, head_y-hr, head_x+hr, head_y+hr), fill=(255, 255, 255), outline=(0, 0, 0), width=5)
+    draw.ellipse((head_x-9, head_y-4, head_x-4, head_y+1), fill=(0, 0, 0))
+    draw.ellipse((head_x+5, head_y-4, head_x+10, head_y+1), fill=(0, 0, 0))
+    draw.arc((head_x-8, head_y+1, head_x+9, head_y+15), 5, 170, fill=(0, 0, 0), width=2)
+    draw.line((head_x, head_y+25, head_x, head_y+91), fill=(0, 0, 0), width=10)
+    draw.line((head_x, head_y+35, head_x-31, head_y+62), fill=(0, 0, 0), width=8)
+    draw.line((head_x-31, head_y+62, head_x-47, head_y+47), fill=(0, 0, 0), width=8)
+    draw.line((head_x, head_y+35, head_x+34, head_y+57), fill=(0, 0, 0), width=8)
+    draw.line((head_x+34, head_y+57, head_x+52, head_y+37), fill=(0, 0, 0), width=8)
+    draw.line((head_x, head_y+91, head_x-25, head_y+131), fill=(0, 0, 0), width=9)
+    draw.line((head_x, head_y+91, head_x+28, head_y+131), fill=(0, 0, 0), width=9)
+    draw.line((head_x-25, head_y+131, head_x-39, head_y+131), fill=(255, 255, 255), width=8)
+    draw.line((head_x+28, head_y+131, head_x+43, head_y+131), fill=(255, 255, 255), width=8)
+    # Small descriptor strip, used as a visual accent rather than readable generated text.
+    draw.rounded_rectangle((8, 8, width-8, 35), radius=8, fill=(0, 0, 0))
+    draw.rectangle((13, 14, 28, 29), fill=(255, 190, 34))
+    return image
+
+
+def upscale_save(image: Image.Image, path: Path, *, png: bool = False) -> None:
+    image = image.convert("RGB").resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+    image = image.filter(ImageFilter.UnsharpMask(radius=1.35, percent=125, threshold=3))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if png:
+        image.save(path, format="PNG", optimize=True)
+    else:
+        image.save(path, format="JPEG", quality=91, optimize=True, progressive=True)
+
+
+def load_image_pipeline() -> tuple[Any, Any, str]:
+    try:
+        import torch
+        from diffusers import AutoPipelineForText2Image
+        torch.set_num_threads(max(1, min(2, os.cpu_count() or 1)))
+        has_gpu = torch.cuda.is_available()
+        device = "cuda" if has_gpu else "cpu"
+        dtype = torch.float16 if has_gpu else torch.float32
+        log(f"Loading local image model {IMAGE_MODEL_ID} on {device} ({dtype}).")
+        pipe = AutoPipelineForText2Image.from_pretrained(
+            IMAGE_MODEL_ID,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
+        )
+        try:
+            pipe.enable_attention_slicing("max")
+        except Exception:
+            try:
+                pipe.enable_attention_slicing()
+            except Exception:
+                pass
+        try:
+            pipe.enable_vae_tiling()
+        except Exception:
+            pass
+        pipe.to(device)
+        pipe.set_progress_bar_config(disable=True)
+        return torch, pipe, device
+    except Exception as exc:
+        log(f"Local diffusion model could not load; Pillow vector illustrations will be used to finish safely: {exc}")
+        return None, None, "pillow-fallback"
+
+
+def make_model_image(torch: Any, pipe: Any, device: str, prompt: str, seed: int) -> Image.Image:
+    generator = None
+    try:
+        if torch is not None:
+            generator = torch.Generator(device=device).manual_seed(seed)
+        if "turbo" in IMAGE_MODEL_ID.casefold():
+            inference_steps = 1
+            guidance = 0.0
+            negative = None
         else:
-            cfg.topic = choose_topic(cfg, llm, history)
-            save_json(pend_path, {"topic": cfg.topic, "minutes": cfg.minutes, "done": False})
-            log(f"Auto-selected topic: {cfg.topic}")
-    slug = re.sub(r"[^a-z0-9]+", "-", cfg.topic.lower()).strip("-")[:48] + f"-{cfg.minutes:g}m"
-    if cfg.smoke:
-        slug += "-smoke"
-    P = Paths(cfg, slug)
-    state = load_json(P.state, None) or {"version": 1, "slug": slug, "stages": {}}
-    if not state.get("seed"):
-        state["seed"] = cfg.seed or int(time.time()) % 1000000
-    state["config"] = {k: v for k, v in vars(cfg).items()}
-    save_json(P.state, state)
-    log(f"Project '{slug}' | {cfg.minutes:g} min | {cfg.H}p | seed {state['seed']} | smoke={cfg.smoke}")
+            # Tiny-SD is a compact public diffusion model rather than a turbo one-step model.
+            inference_steps = 4
+            guidance = 5.0
+            negative = NEGATIVE_PROMPT
+        result = pipe(
+            prompt=prompt,
+            negative_prompt=negative,
+            width=512,
+            height=288,
+            num_inference_steps=inference_steps,
+            guidance_scale=guidance,
+            generator=generator,
+        )
+        if not result.images:
+            raise RuntimeError("Image model returned an empty image list")
+        return result.images[0].convert("RGB")
+    except Exception as exc:
+        log(f"Image inference failed for one scene; using illustrated fallback for this scene: {exc}")
+        return fallback_vector_art(prompt[:180], seed)
 
-    fp = find_font(cfg)
-    log(f"Font: {fp or 'PIL default'}")
-    budget_s = cfg.budget_minutes * 60
-    video_s = cfg.minutes * 60
-    cores = os.cpu_count() or 2
-    res_factor = 1.0 if cfg.H <= 720 else 2.3
-    core_factor = 1.0 if cores >= 4 else 2.0
-    # time kept free for subtitles, thumbnail, SEO, render and final encode (deliberately pessimistic)
-    reserve = 900 + video_s * 2.2 * res_factor * core_factor
-    image_deadline = T0 + budget_s - reserve
-    log(f"{cores} CPU cores. Time budget {cfg.budget_minutes:g} min; images must finish by +{(image_deadline - T0) / 60:.0f} min "
-        f"(reserve {reserve / 60:.0f} min for render)")
 
-    piper = Piper(cfg)
-    log(f"Piper: {'ready' if piper.available else 'NOT available'} ({piper.exe}, {piper.model.name})")
+def map_visual_windows(timings: list[dict[str, Any]], script_data: dict[str, Any], target_duration: float) -> list[dict[str, Any]]:
+    scene_count = int(math.ceil(target_duration / IMAGE_INTERVAL))
+    windows: list[dict[str, Any]] = []
+    for index in range(scene_count):
+        start = index * IMAGE_INTERVAL
+        end = min(target_duration, (index + 1) * IMAGE_INTERVAL)
+        overlapping = [record for record in timings if record["speech_end_time"] > start and record["start_time"] < end]
+        if overlapping:
+            chosen = max(overlapping, key=lambda rec: max(0.0, min(end, rec["speech_end_time"]) - max(start, rec["start_time"])))
+        else:
+            chosen = timings[min(len(timings) - 1, int(start / max(target_duration, 1.0) * len(timings)))]
+        description = visual_description(chosen["text"], script_data["topic"], chosen["chapter_title"], index)
+        windows.append({
+            "index": index,
+            "start_time": round(start, 3),
+            "end_time": round(end, 3),
+            "chapter_title": chosen["chapter_title"],
+            "source_sentence": chosen["text"],
+            "visual_description": description,
+            "prompt": stickman_prompt(description),
+        })
+    return windows
 
-    wps = stage_calibrate(cfg, P, state, piper)
-    stage_script(cfg, P, state, wps, llm)
-    stage_scenes(cfg, P, state, wps)
-    stage_audio(cfg, P, state, piper)
-    stage_prompts(cfg, P, state, llm)
-    stage_images(cfg, P, state, image_deadline, fp)
-    stage_subtitles(cfg, P, state, fp)
-    stage_thumbnail(cfg, P, state, llm, fp)
-    stage_seo(cfg, P, state, llm)
-    left = T0 + budget_s - time.time()
-    need = 300 + state["total_seconds"] * 1.0 * res_factor * core_factor
-    if left < need and not (cfg.animation == "off" and cfg.transition in ("cut", "off")):
-        warn(f"Only {left / 60:.0f} min left for rendering (~{need / 60:.0f} min needed): switching to the light render "
-             "(no scene motion, direct cuts) to finish inside the time limit")
-        cfg.animation, cfg.transition = "off", "cut"
-    raw = stage_render(cfg, P, state)
-    report = stage_final(cfg, P, state, raw, slug)
-    record_topic(cfg, state, history, pend_path)
-    save_json(Path(cfg.output) / "latest.json", {"topic": cfg.topic, "title": report["title"], "slug": slug,
-                                                  "video": report["file"], "seo_file": str(P.out / f"{slug}_seo.txt")})
-    write_summary(report)
-    log(f"DONE: {report['file']} ({report['duration_seconds'] / 60:.1f} min, {report['scenes']} scenes, "
-        f"{report['size_mb']} MB, {report['pipeline_minutes']} min pipeline time)")
+
+def generate_images(windows: list[dict[str, Any]], script_data: dict[str, Any]) -> tuple[list[Path], str]:
+    image_dir = WORK / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    state = load_json(CHECKPOINT, {}) or {}
+    missing = [window for window in windows if not (image_dir / f"scene_{window['index']:04d}.jpg").exists()]
+    torch = pipe = None
+    device = "pillow-fallback"
+    backend = state.get("image_backend", "")
+    if missing:
+        torch, pipe, device = load_image_pipeline()
+        backend = IMAGE_MODEL_ID if pipe is not None else "Pillow vector fallback (local model unavailable)"
+        total = len(windows)
+        for count, window in enumerate(windows, 1):
+            image_path = image_dir / f"scene_{window['index']:04d}.jpg"
+            if image_path.exists():
+                continue
+            seed = (int(time.time()) + window["index"] * 7919) % 2_147_483_647
+            if pipe is not None:
+                image = make_model_image(torch, pipe, device, window["prompt"], seed)
+            else:
+                image = fallback_vector_art(window["visual_description"], seed)
+            upscale_save(image, image_path)
+            del image
+            atomic_json(CHECKPOINT, {**state, "stage": "images_generating", "image_count": count, "scene_count": total, "image_backend": backend})
+            if count % 5 == 0 or count == total:
+                log(f"Scene images: {count}/{total}")
+            gc.collect()
+            try:
+                if torch is not None and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+        if pipe is not None:
+            del pipe
+        if torch is not None:
+            del torch
+        gc.collect()
+    paths = [image_dir / f"scene_{window['index']:04d}.jpg" for window in windows]
+    if not all(path.exists() for path in paths):
+        raise RuntimeError("One or more scene images are missing after the image generation stage.")
+    atomic_json(WORK / "scene_prompts.json", windows)
+    state = load_json(CHECKPOINT, {}) or {}
+    atomic_json(CHECKPOINT, {**state, "stage": "images_ready", "image_count": len(paths), "scene_count": len(paths), "image_backend": backend or "reused cached images"})
+    return paths, backend or "reused cached images"
+
+
+def create_thumbnail(script_data: dict[str, Any], titles: list[str]) -> Path:
+    release_dir = WORK / "release"
+    release_dir.mkdir(parents=True, exist_ok=True)
+    thumb_path = release_dir / "thumbnail.png"
+    if thumb_path.exists() and thumb_path.stat().st_size > 20_000:
+        return thumb_path
+    torch, pipe, device = load_image_pipeline()
+    description = "extreme colorful wealth imagery, a towering pile of gold coins, an emerald rocket-shaped growth arrow, a vivid red debt meter, luxury buildings, and dramatic financial chart shapes"
+    prompt = stickman_prompt(description, "Eye-catching documentary thumbnail composition, clear center-left black-and-white stickman, vibrant colors, cinematic contrast, no text.")
+    seed = random.SystemRandom().randrange(1, 2_147_483_647)
+    if pipe is not None:
+        image = make_model_image(torch, pipe, device, prompt, seed)
+        del pipe
+        del torch
+        gc.collect()
+    else:
+        image = fallback_vector_art(description, seed)
+    image = image.convert("RGB").resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+    image = image.filter(ImageFilter.UnsharpMask(radius=1.5, percent=140, threshold=3))
+    draw = ImageDraw.Draw(image, "RGBA")
+    # Strong editable thumbnail typography, not text baked by the image model.
+    topic_words = re.findall(r"[A-Za-z0-9]+", script_data["topic"].upper())
+    compact = " ".join(topic_words[:3]) if topic_words else "MONEY MINDSET"
+    if len(compact) > 19:
+        compact = " ".join(topic_words[:2])
+    box = (65, 735, 1170, 1010)
+    draw.rounded_rectangle(box, radius=26, fill=(0, 0, 0, 195), outline=(255, 202, 40, 255), width=8)
+    font = choose_font(106, bold=True)
+    words = compact.split()
+    lines: list[str] = []
+    line = ""
+    for word in words:
+        candidate = f"{line} {word}".strip()
+        if draw.textbbox((0, 0), candidate, font=font, stroke_width=3)[2] > 1030 and line:
+            lines.append(line)
+            line = word
+        else:
+            line = candidate
+    if line:
+        lines.append(line)
+    if len(lines) > 2:
+        lines = lines[:2]
+    y = 765 if len(lines) == 2 else 820
+    for line in lines:
+        draw.text((100, y), line, font=font, fill=(255, 218, 70, 255), stroke_width=7, stroke_fill=(0, 0, 0, 255))
+        y += 115
+    image.save(thumb_path, format="PNG", optimize=True)
+    return thumb_path
+
+
+def ass_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    total_cs = int(round(seconds * 100))
+    hours, remainder = divmod(total_cs, 360000)
+    minutes, remainder = divmod(remainder, 6000)
+    whole_seconds, centiseconds = divmod(remainder, 100)
+    return f"{hours}:{minutes:02d}:{whole_seconds:02d}.{centiseconds:02d}"
+
+
+def ass_escape(text: str) -> str:
+    text = text.replace("\\", "")
+    text = text.replace("{", "(").replace("}", ")")
+    return text
+
+
+def subtitle_word(text: str) -> str:
+    clean = ass_escape(text)
+    key = re.sub(r"[^A-Z]", "", clean.upper())
+    important = {"MONEY", "WEALTH", "DEBT", "BILLIONS", "CRASH", "PROFIT", "SECRET", "ASSET", "ASSETS", "RISK", "INFLATION", "COMPOUND", "INTEREST", "CASHFLOW", "FREEDOM", "INCOME", "INVESTING", "SAVING"}
+    if key in important:
+        return r"{\c&H0000D7FF&}" + clean + r"{\c&H00FFFFFF&}"
+    return clean
+
+
+def create_ass_subtitles(timings: list[dict[str, Any]]) -> Path:
+    path = WORK / "subtitles.ass"
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        f"PlayResX: {WIDTH}",
+        f"PlayResY: {HEIGHT}",
+        "YCbCr Matrix: TV.709",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        "Style: Default,Anton,86,&H00FFFFFF,&H0000D7FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,6,3,2,100,100,85,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    animation = r"{\fscx65\fscy65\t(0,90,\fscx108\fscy108)\t(90,150,\fscx100\fscy100)}"
+    for record in timings:
+        tokens = record["text"].split()
+        if not tokens:
+            continue
+        chunks = [tokens[i:i+4] for i in range(0, len(tokens), 4)]
+        weights = [sum(max(1, len(re.sub(r"\W", "", word))) for word in chunk) for chunk in chunks]
+        weight_sum = max(1, sum(weights))
+        start = float(record["start_time"])
+        speech_end = float(record["speech_end_time"])
+        speech_duration = max(0.08, speech_end - start)
+        cursor = start
+        cumulative_weight = 0
+        for chunk_index, chunk in enumerate(chunks):
+            cumulative_weight += weights[chunk_index]
+            if chunk_index == len(chunks) - 1:
+                end = speech_end
+            else:
+                end = start + speech_duration * cumulative_weight / weight_sum
+            end = max(cursor + 0.04, min(speech_end, end))
+            content = " ".join(subtitle_word(word) for word in chunk)
+            lines.append(f"Dialogue: 0,{ass_time(cursor)},{ass_time(end)},Default,,0,0,0,,{animation}{content}")
+            cursor = end
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    return path
+
+
+def make_titles(topic: str) -> list[str]:
+    seeds = [
+        f"{topic}: The Money Mistake Most People Miss",
+        f"The Hidden Financial Cost of {topic}",
+        f"What {topic} Can Teach You About Building Wealth",
+        f"The Psychology Behind {topic} (Explained Simply)",
+        f"{topic}: The Quiet Choice That Changes Your Money",
+    ]
+    return list(dict.fromkeys(seeds))[:5]
+
+
+def format_chapter_timestamp(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def build_chapter_times(chapters: list[dict[str, Any]], timings: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    for index, chapter in enumerate(chapters):
+        first = next((item for item in timings if item["chapter_index"] == index), None)
+        if first is not None:
+            result.append((format_chapter_timestamp(first["start_time"]), chapter["title"]))
+    return result
+
+
+def create_seo(script_data: dict[str, Any], timings: list[dict[str, Any]], target_duration: float, test_run: bool, image_backend: str) -> tuple[Path, Path]:
+    release_dir = WORK / "release"
+    release_dir.mkdir(parents=True, exist_ok=True)
+    seo_path = release_dir / "youtube_seo.txt"
+    notes_path = release_dir / "release_notes.md"
+    titles = make_titles(script_data["topic"])
+    chapter_times = build_chapter_times(script_data["chapters"], timings)
+    overview = (
+        f"What if the biggest change in your finances did not begin with a bigger paycheck, but with seeing {script_data['topic'].lower()} more clearly? "
+        "This documentary breaks the subject into practical mechanisms, behavioral patterns, trade-offs, and questions you can use to review your own decisions. "
+        "It is educational content, not personalized financial, tax, or investment advice. Outcomes vary, and no strategy guarantees returns."
+    )
+    description = (
+        f"{overview}\n\nIn this episode, you will explore the numbers beneath everyday money choices, the psychology that can distort them, "
+        "and the habits that can make a financial plan more resilient. The goal is not a secret shortcut; it is a clearer way to reason about risk, time, costs, and options.\n\n"
+        "CHAPTERS\n" + "\n".join(f"{stamp} {title}" for stamp, title in chapter_times) +
+        "\n\nDisclaimer: This video is for general education only and does not constitute financial, investment, legal, or tax advice. Research independently and consider your circumstances and risk tolerance."
+    )
+    seo_text = (
+        "5 TITLE OPTIONS\n" + "\n".join(f"{i}. {title}" for i, title in enumerate(titles, 1)) +
+        "\n\nFULL YOUTUBE DESCRIPTION\n" + description +
+        "\n\n35 TAGS\n" + ", ".join(TAG_LIST) +
+        f"\n\nVIDEO METADATA\nTopic: {script_data['topic']}\nMode: {'1-minute test' if test_run else '30-minute documentary'}\n"
+        f"Target duration: {target_duration:.3f} seconds\nScript words: {script_data['word_count']}\nImage backend: {image_backend}\n"
+    )
+    seo_path.write_text(seo_text, encoding="utf-8")
+    notes_path.write_text(
+        f"# Stickman Finance Documentary\n\nTopic: {script_data['topic']}\n\n"
+        f"Mode: {'1-minute TEST render' if test_run else '30-minute full render'}\n\n"
+        f"Duration: {format_chapter_timestamp(target_duration)}\n\n"
+        f"Script words: {script_data['word_count']}\n\n"
+        f"Image backend: {image_backend}\n\n"
+        "The episode uses locally-run model inference where the public model weights are available. Word-subtitle boundaries are estimated proportionally within each Kokoro sentence; they are not forced-aligned phoneme timings.\n",
+        encoding="utf-8",
+    )
+    return seo_path, notes_path
+
+
+def render_video(image_paths: list[Path], narration_path: Path, subtitle_path: Path, target_duration: float) -> Path:
+    """Render a static 5-second-per-image slideshow. Only ASS subtitles animate."""
+    if not image_paths:
+        raise RuntimeError("No scene images were generated.")
+    release_dir = WORK / "release"
+    release_dir.mkdir(parents=True, exist_ok=True)
+    final_path = release_dir / "final_documentary.mp4"
+    state = load_json(CHECKPOINT, {}) or {}
+    if final_path.exists() and final_path.stat().st_size > 10_000:
+        try:
+            existing_duration = check_ffprobe_duration(final_path)
+        except Exception:
+            existing_duration = 0.0
+        if abs(existing_duration - target_duration) <= 0.5:
+            log("Reusing a valid final rendered MP4 from checkpoint.")
+            atomic_json(CHECKPOINT, {**state, "stage": "rendered", "video_seconds": existing_duration})
+            return final_path
+
+    # FFmpeg concat demuxer holds each still image for exactly five seconds.
+    # No zoompan, pan, fade, xfade, or other image/scene animation is applied.
+    concat_path = WORK / "still_images.txt"
+    concat_path.parent.mkdir(parents=True, exist_ok=True)
+    scene_duration = IMAGE_INTERVAL
+    with concat_path.open("w", encoding="utf-8") as handle:
+        for image_path in image_paths:
+            escaped = str(image_path.resolve()).replace("\\", "/").replace("'", "'\\''")
+            handle.write(f"file '{escaped}'\n")
+            handle.write(f"duration {scene_duration:.6f}\n")
+        # concat demuxer needs a final repeated file to honor the final duration.
+        escaped = str(image_paths[-1].resolve()).replace("\\", "/").replace("'", "'\\''")
+        handle.write(f"file '{escaped}'\n")
+
+    subtitle_file = str(subtitle_path.resolve()).replace("\\", "/").replace("'", "\\'")
+    font_dir = "/usr/share/fonts/truetype/custom" if Path("/usr/share/fonts/truetype/custom").exists() else "/usr/share/fonts/truetype/dejavu"
+    subtitle_filter = f"ass=filename='{subtitle_file}':fontsdir='{font_dir}'"
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(concat_path),
+        "-i", str(narration_path),
+        "-vf", f"fps={FPS},scale={WIDTH}:{HEIGHT}:flags=lanczos,{subtitle_filter},format=yuv420p",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-t", f"{target_duration:.3f}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-ar", str(SAMPLE_RATE),
+        "-movflags", "+faststart", "-threads", "2", str(final_path),
+    ]
+    log(f"Rendering {len(image_paths)} static images at {IMAGE_INTERVAL:g}s each; only subtitles are animated.")
+    run_checked(command, cwd=WORK)
+    if not final_path.exists() or final_path.stat().st_size < 10_000:
+        raise RuntimeError("FFmpeg did not produce a valid final_documentary.mp4.")
+    atomic_json(CHECKPOINT, {**(load_json(CHECKPOINT, {}) or {}), "stage": "rendered", "scene_count": len(image_paths), "video_seconds": target_duration})
+    return final_path
+
+
+def ensure_release_outputs(script_data: dict[str, Any], target_duration: float, test_run: bool, image_backend: str, timings: list[dict[str, Any]]) -> dict[str, Path]:
+    release_dir = WORK / "release"
+    release_dir.mkdir(parents=True, exist_ok=True)
+    thumb = create_thumbnail(script_data, make_titles(script_data["topic"]))
+    seo, notes = create_seo(script_data, timings, target_duration, test_run, image_backend)
+    final_video = release_dir / "final_documentary.mp4"
+    for path in (final_video, thumb, seo, notes):
+        if not path.exists() or path.stat().st_size == 0:
+            raise RuntimeError(f"Expected release asset missing or empty: {path}")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for path in (final_video, thumb, seo, notes):
+        shutil.copy2(path, OUTPUT_DIR / path.name)
+    return {"video": final_video, "thumbnail": thumb, "seo": seo, "notes": notes}
+
+
+def set_github_output(name: str, value: str) -> None:
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path:
+        return
+    delimiter = f"END_{uuid.uuid4().hex}"
+    with open(output_path, "a", encoding="utf-8") as handle:
+        handle.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
+
+
+def mark_published() -> int:
+    state = load_json(CHECKPOINT, {})
+    if not state:
+        log("No checkpoint found; nothing to mark as published.")
+        return 0
+    state["stage"] = "complete"
+    state["published_at"] = datetime.now(timezone.utc).isoformat()
+    atomic_json(CHECKPOINT, state)
+    for child in list(WORK.iterdir()) if WORK.exists() else []:
+        if child.name == "checkpoint.json":
+            continue
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            try:
+                child.unlink()
+            except OSError:
+                pass
+    log("Release upload succeeded; removed temporary audio, images, clips and intermediate files.")
     return 0
 
 
-if __name__ == "__main__":
+def reset_work() -> None:
+    if WORK.exists():
+        shutil.rmtree(WORK, ignore_errors=True)
+    WORK.mkdir(parents=True, exist_ok=True)
+
+
+def check_ffprobe_duration(path: Path) -> float:
+    result = run_checked([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+    ], capture=True)
     try:
-        sys.exit(main())
-    except PipelineError as e:
-        log(str(e), "ERROR")
-        sys.exit(2)
-    except KeyboardInterrupt:
-        sys.exit(130)
+        return float(result.stdout.strip())
+    except (AttributeError, ValueError):
+        return 0.0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build a 1-minute test or 30-minute stickman finance documentary.")
+    parser.add_argument("--test-run", action="store_true", help="Build exactly a one-minute test video instead of a full documentary.")
+    parser.add_argument("--mark-published", action="store_true", help="Mark the current build as published and delete temporary files.")
+    args = parser.parse_args()
+
+    if args.mark_published:
+        return mark_published()
+
+    assert_tools()
+    random.seed()
+    mode = "test" if args.test_run else "full"
+    target_duration = float(VIDEO_SECONDS_TEST if args.test_run else VIDEO_SECONDS_FULL)
+    existing = load_json(CHECKPOINT, {})
+    can_resume = bool(existing and existing.get("stage") != "complete" and existing.get("mode") == mode and existing.get("episode_id"))
+    if can_resume:
+        state = existing
+        topic = str(state.get("topic") or select_topic())
+        log(f"Resuming checkpoint for {state.get('episode_id')} at stage {state.get('stage')}.")
+    else:
+        reset_work()
+        topic = select_topic()
+        episode_id = datetime.now(timezone.utc).strftime("ep_%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:6]
+        state = {"mode": mode, "topic": topic, "episode_id": episode_id, "stage": "started", "started_at": datetime.now(timezone.utc).isoformat()}
+        atomic_json(CHECKPOINT, state)
+        log(f"Starting new {mode} episode: {topic}")
+
+    try:
+        script_path = WORK / "script.json"
+        if script_path.exists() and (load_json(CHECKPOINT, {}) or {}).get("stage") in {"script_ready", "audio_generating", "audio_ready", "images_generating", "images_ready", "clips_generating", "clips_ready", "rendered"}:
+            script_data = load_json(script_path)
+            log("Reusing script.json from checkpoint.")
+        else:
+            script_data = generate_script(topic, args.test_run)
+            atomic_json(script_path, script_data)
+            (WORK / "script.txt").write_text(script_data["script_text"], encoding="utf-8")
+            state = {**(load_json(CHECKPOINT, {}) or state), "stage": "script_ready", "script_words": script_data["word_count"]}
+            atomic_json(CHECKPOINT, state)
+        if not script_data or not script_data.get("chapters"):
+            raise RuntimeError("Script generation did not create any chapters.")
+
+        timings = generate_narration(script_data, target_duration)
+        windows = map_visual_windows(timings, script_data, target_duration)
+        image_paths, image_backend = generate_images(windows, script_data)
+        subtitle_path = create_ass_subtitles(timings)
+        thumb_path = WORK / "release" / "thumbnail.png"
+        if not thumb_path.exists() or thumb_path.stat().st_size < 20_000:
+            # Reuse the loaded scene images; image model is reloaded only for a missing thumbnail.
+            create_thumbnail(script_data, make_titles(topic))
+        video_path = render_video(image_paths, WORK / "audio" / "narration.wav", subtitle_path, target_duration)
+        assets = ensure_release_outputs(script_data, target_duration, args.test_run, image_backend, timings)
+        duration = check_ffprobe_duration(assets["video"])
+        if abs(duration - target_duration) > 0.5:
+            raise RuntimeError(f"Final MP4 duration is {duration:.3f}s; expected {target_duration:.3f}s.")
+
+        release_name = f"{'[TEST] ' if args.test_run else ''}Stickman Finance — {topic}"
+        set_github_output("release_name", release_name)
+        set_github_output("topic", topic)
+        set_github_output("video_seconds", f"{duration:.3f}")
+        state = {
+            **(load_json(CHECKPOINT, {}) or state),
+            "stage": "rendered",
+            "mode": mode,
+            "topic": topic,
+            "release_name": release_name,
+            "scene_count": len(image_paths),
+            "script_words": script_data["word_count"],
+            "video_seconds": duration,
+            "image_backend": image_backend,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        atomic_json(CHECKPOINT, state)
+        log(f"Build ready: {assets['video']} ({duration:.3f}s), {len(image_paths)} images, {script_data['word_count']} script words.")
+        log("GitHub Actions will publish the video, thumbnail and SEO file as a GitHub Release.")
+        return 0
+    except Exception as exc:
+        current = load_json(CHECKPOINT, {}) or state
+        current["last_error"] = str(exc)
+        current["last_error_at"] = datetime.now(timezone.utc).isoformat()
+        current["last_traceback"] = traceback.format_exc()[-12000:]
+        atomic_json(CHECKPOINT, current)
+        log(f"PIPELINE FAILED: {exc}")
+        traceback.print_exc()
+        return 1
+    finally:
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
