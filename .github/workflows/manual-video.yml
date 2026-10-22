@@ -1,224 +1,175 @@
-name: Stickman Finance Doodle Video
+name: Stickman Finance Documentary Studio (Local AI)
 
 on:
   workflow_dispatch:
     inputs:
-      topic:
-        description: "Finance topic - leave as 'auto' and the pipeline picks a fresh topic itself"
-        required: false
-        default: "auto"
-      minutes:
-        description: "Maximum / target video length (minutes)"
-        type: choice
-        default: "25"
-        options: ["20", "25", "30"]
-      resolution:
-        description: "Output height"
-        type: choice
-        default: "720"
-        options: ["720", "1080"]
-      audience:
-        description: "Target audience (optional)"
-        required: false
-        default: ""
-      tone:
-        description: "Tone (optional)"
-        required: false
-        default: ""
-      animation:
-        type: choice
-        default: "random"
-        options: ["random", "cinematic", "minimal", "off"]
-      transition:
-        type: choice
-        default: "random"
-        options: ["random", "crossfade", "cinematic", "cut", "off"]
-      subtitle_mode:
-        description: "Words per subtitle round"
-        type: choice
-        default: "4"
-        options: ["4", "1", "2", "sentence"]
-      resume:
-        description: "Resume an earlier unfinished run of the same topic/length (restores cached project)"
+      test_run:
+        description: "TRUE = 1-minute test video; FALSE = full ~30-minute documentary"
+        required: true
         type: boolean
-        default: false
-      upload_release:
-        description: "Also publish the video as a GitHub Release (no 500 MB artifact quota)"
-        type: boolean
-        default: false
-  # Uncomment to make a new video fully automatically (topic is auto-picked) every Monday 03:00 UTC:
-  # schedule:
-  #   - cron: "0 3 * * 1"
-
-concurrency:
-  group: doodle-video
-  cancel-in-progress: false
+        default: true
 
 permissions:
   contents: write
 
+
+concurrency:
+  group: stickman-finance-studio-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build-video:
+  build-and-release:
+    name: Generate video and publish GitHub Release
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 360
     env:
-      TOPIC: ${{ inputs.topic || 'auto' }}
-      MINUTES: ${{ inputs.minutes || '25' }}
-      RESOLUTION: ${{ inputs.resolution || '720' }}
-      AUDIENCE: ${{ inputs.audience }}
-      TONE: ${{ inputs.tone }}
-      ANIMATION: ${{ inputs.animation || 'random' }}
-      TRANSITION: ${{ inputs.transition || 'random' }}
-      SUBTITLE_MODE: ${{ inputs.subtitle_mode || '4' }}
-      OLLAMA_MODEL: gemma2:2b
-      SD_MODEL: Lykon/dreamshaper-8
-      SD_STEPS: "12"
-      # Pipeline-internal time budget (minutes, counted from pipeline start).
-      # Job limit is 355 min; ~25 min go to setup, the rest is protected by this budget.
-      BUDGET_MINUTES: "300"
       PYTHONUNBUFFERED: "1"
-      HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+      TEXT_MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
+      IMAGE_MODEL_ID: stabilityai/sdxl-turbo
+      KOKORO_VOICE: am_puck
+      TORCH_NUM_THREADS: "2"
       TOKENIZERS_PARALLELISM: "false"
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Free disk space
+      - name: Restore model cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .hf-cache/hub
+          key: finance-models-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            finance-models-${{ runner.os }}-
+
+      - name: Restore pipeline checkpoint and intermediate assets
+        uses: actions/cache/restore@v4
+        with:
+          path: studio_work
+          key: finance-work-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            finance-work-${{ runner.os }}-${{ github.ref_name }}-
+
+      - name: Install system packages
+        shell: bash
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
-          df -h /
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg espeak-ng libsndfile1 fontconfig fonts-dejavu-core curl ca-certificates
+          sudo mkdir -p /usr/share/fonts/truetype/custom
+          if curl --retry 3 --retry-delay 2 -fsSL \
+            'https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton%5Bwght%5D.ttf' \
+            -o /tmp/Anton-Regular.ttf; then
+            sudo install -m 0644 /tmp/Anton-Regular.ttf /usr/share/fonts/truetype/custom/Anton-Regular.ttf
+          else
+            echo 'Anton font download unavailable; DejaVu Sans Bold remains installed as fallback.'
+          fi
+          sudo fc-cache -f
+          ffmpeg -version | head -n 2
+          ffprobe -version | head -n 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/workflows/stickman-finance.yml
 
-      - name: System packages (FFmpeg, fonts, zstd)
+      - name: Install CPU PyTorch and Python dependencies
+        shell: bash
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y ffmpeg fonts-dejavu-core zstd curl
-          ffmpeg -hide_banner -version | head -1
-          ffmpeg -hide_banner -filters | grep -E " (xfade|zoompan|ass) "
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install \
+            "kokoro>=0.9.4" \
+            "misaki[en]>=0.9.4" \
+            "diffusers>=0.35.0" \
+            "transformers>=4.45.0" \
+            "accelerate>=0.30.0" \
+            "safetensors>=0.4.5" \
+            "huggingface_hub>=0.26.0" \
+            "pillow>=10.0.0" \
+            "soundfile>=0.12.1" \
+            "numpy>=1.26.0,<3" \
+            "requests>=2.31.0" \
+            sentencepiece
+          python - <<'PY'
+          import torch, PIL, soundfile, numpy
+          print('PyTorch:', torch.__version__, 'CUDA available:', torch.cuda.is_available())
+          print('Pillow:', PIL.__version__, 'NumPy:', numpy.__version__, 'SoundFile:', soundfile.__version__)
+          PY
 
-      - name: Cache models and tools
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/huggingface
-            tools
-            assets
-          key: doodle-assets-v1
-
-      - name: Python packages (CPU-only PyTorch)
+      - name: Confirm local-only model configuration
         run: |
-          python -m pip install --upgrade pip
-          pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy==1.26.4 Pillow==10.4.0 requests==2.32.3 \
-            diffusers==0.30.3 transformers==4.44.2 accelerate==0.34.2 \
-            huggingface_hub==0.25.2 safetensors==0.4.5
+          echo "Text model: $TEXT_MODEL_ID (downloaded weights, local inference)"
+          echo "Image model: $IMAGE_MODEL_ID (Diffusers local inference)"
+          echo "TTS: Kokoro voice $KOKORO_VOICE (local inference)"
+          echo "No paid AI API keys are configured."
 
-      - name: Download Piper, voice and marker font
+      - name: Generate the documentary
+        id: build
+        shell: bash
         run: |
-          mkdir -p tools/voices assets/fonts
-          if [ ! -x tools/piper/piper ]; then
-            curl -fsSL -o piper.tgz https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
-            tar -xzf piper.tgz -C tools
-            rm piper.tgz
+          set -euo pipefail
+          if [[ "${{ inputs.test_run }}" == "true" ]]; then
+            echo 'Starting 1-minute TEST run (12 still images, 5 seconds each).'
+            python pipeline.py --test-run
+          else
+            echo 'Starting full ~30-minute documentary run (360 still images, 5 seconds each).'
+            python pipeline.py
           fi
-          V=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium
-          [ -s tools/voices/en_US-lessac-medium.onnx ] || curl -fsSL -o tools/voices/en_US-lessac-medium.onnx "$V/en_US-lessac-medium.onnx"
-          [ -s tools/voices/en_US-lessac-medium.onnx.json ] || curl -fsSL -o tools/voices/en_US-lessac-medium.onnx.json "$V/en_US-lessac-medium.onnx.json"
-          [ -s assets/fonts/PermanentMarker-Regular.ttf ] || curl -fsSL -o assets/fonts/PermanentMarker-Regular.ttf \
-            https://github.com/google/fonts/raw/main/apache/permanentmarker/PermanentMarker-Regular.ttf \
-            || echo "Marker font download failed - DejaVu Sans Bold will be used"
-          chmod +x tools/piper/piper
 
-      - name: Piper preflight (fail early with a clear error)
-        run: |
-          echo "Testing Piper." | tools/piper/piper --model tools/voices/en_US-lessac-medium.onnx \
-            --output_file /tmp/piper_test.wav --espeak_data tools/piper/espeak-ng-data
-          test -s /tmp/piper_test.wav
-          ls -l /tmp/piper_test.wav
-
-      - name: Install Ollama and pull Gemma
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          if ! curl -fs http://127.0.0.1:11434/api/tags >/dev/null; then
-            nohup ollama serve > ollama.log 2>&1 &
-            for i in $(seq 1 60); do
-              curl -fs http://127.0.0.1:11434/api/tags >/dev/null && break
-              sleep 2
-            done
-          fi
-          ollama pull "$OLLAMA_MODEL"
-          ollama list
-
-      - name: Compute project cache key
-        run: echo "PROJECT_KEY=$(echo -n "$TOPIC|$MINUTES|$RESOLUTION" | sha1sum | cut -c1-12)" >> "$GITHUB_ENV"
-
-      - name: Restore unfinished project (resume mode)
-        if: ${{ inputs.resume == true }}
-        uses: actions/cache/restore@v4
+      - name: Publish assets to a GitHub Release
+        id: release
+        uses: softprops/action-gh-release@v3
         with:
-          path: |
-            projects
-            !projects/**/render/pieces/**
-          key: project-${{ env.PROJECT_KEY }}-${{ github.run_id }}
-          restore-keys: project-${{ env.PROJECT_KEY }}-
+          tag_name: stickman-finance-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.build.outputs.release_name }}
+          body_path: output/release_notes.md
+          files: |
+            output/final_documentary.mp4
+            output/thumbnail.png
+            output/youtube_seo.txt
+            output/release_notes.md
+          draft: false
+          prerelease: ${{ inputs.test_run }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate the video
-        run: python pipeline.py
+      - name: Clean temporary assets after successful release
+        if: success()
+        run: python pipeline.py --mark-published
 
-      - name: Save project checkpoint (also after failure or timeout)
-        if: ${{ always() && inputs.resume == true }}
+      - name: Preserve local model cache for the next run
+        if: always()
         uses: actions/cache/save@v4
         with:
-          path: |
-            projects
-            !projects/**/render/pieces/**
-          key: project-${{ env.PROJECT_KEY }}-${{ github.run_id }}
+          path: .hf-cache/hub
+          key: finance-models-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Upload video artifact
-        if: ${{ success() }}
+      - name: Preserve checkpoint for resume after failure
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: studio_work
+          key: finance-work-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload failure checkpoint for diagnosis
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: doodle-video-${{ github.run_number }}
-          path: output/videos/
-          retention-days: 7
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Remember the topic (so it is never repeated)
-        if: ${{ success() }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add topic_history.json
-          if ! git diff --cached --quiet; then
-            git commit -m "Record used video topic"
-            git pull --rebase --autostash || true
-            git push || echo "Could not push topic history (check Settings > Actions > Workflow permissions)"
-          fi
-
-      - name: Publish GitHub Release
-        if: ${{ success() && inputs.upload_release == true }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          SLUG=$(jq -r .slug output/latest.json)
-          TITLE=$(jq -r .title output/latest.json)
-          gh release create "video-${{ github.run_number }}" output/videos/* \
-            --title "$TITLE" \
-            --notes-file "output/videos/${SLUG}_seo.txt"
-
-      - name: Upload logs on failure
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-${{ github.run_number }}
+          name: stickman-studio-checkpoint-${{ github.run_id }}
           path: |
-            ollama.log
-            projects/*/project.json
+            studio_work/checkpoint.json
+            studio_work/script.json
+            studio_work/sentence_timings.json
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 14
