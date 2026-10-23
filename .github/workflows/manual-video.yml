@@ -98,7 +98,7 @@ jobs:
 
       - name: Restore model and package cache (best effort; never required for correctness)
         id: model-cache
-        uses: actions/cache@v6.2.0 # reviewed release version; Node.js 24 runtime
+        uses: actions/cache@v4.2.4 # reviewed release version; Node.js 24 runtime
         continue-on-error: true
         with:
           path: |
