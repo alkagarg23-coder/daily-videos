@@ -1,175 +1,172 @@
-name: Stickman Finance Documentary Studio (Local AI)
+name: Stickman Finance Video Pipeline
 
 on:
   workflow_dispatch:
     inputs:
-      test_run:
-        description: "TRUE = 1-minute test video; FALSE = full ~30-minute documentary"
+      mode:
+        description: "Pipeline mode"
         required: true
+        type: choice
+        options:
+          - TEST RUN — 1 minute
+          - FULL RUN — approximately 30 minutes
+        default: "TEST RUN — 1 minute"
+      topic:
+        description: "Video topic (leave blank for default)"
+        required: false
+        type: string
+        default: ""
+      enable_youtube:
+        description: "Upload to YouTube if OAuth secrets are configured"
+        required: false
         type: boolean
-        default: true
+        default: false
+      youtube_privacy:
+        description: "YouTube privacy status"
+        required: false
+        type: choice
+        options:
+          - unlisted
+          - private
+          - public
+        default: unlisted
 
 permissions:
   contents: write
-
+  actions: read
 
 concurrency:
-  group: stickman-finance-studio-${{ github.ref }}
+  group: finance-video-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build-and-release:
-    name: Generate video and publish GitHub Release
+  produce:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      PYTHONUNBUFFERED: "1"
-      HF_HOME: ${{ github.workspace }}/.hf-cache
-      TEXT_MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
-      IMAGE_MODEL_ID: stabilityai/sdxl-turbo
-      KOKORO_VOICE: am_puck
-      TORCH_NUM_THREADS: "2"
-      TOKENIZERS_PARALLELISM: "false"
-      OMP_NUM_THREADS: "2"
-      MKL_NUM_THREADS: "2"
-      OPENBLAS_NUM_THREADS: "2"
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MODE: ${{ github.event.inputs.mode == 'FULL RUN — approximately 30 minutes' && 'full' || 'test' }}
+      TOPIC: ${{ github.event.inputs.topic }}
+      ENABLE_YOUTUBE: ${{ github.event.inputs.enable_youtube }}
+      YOUTUBE_PRIVACY_STATUS: ${{ github.event.inputs.youtube_privacy }}
+      YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+      YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+      YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore model cache
-        uses: actions/cache/restore@v4
-        with:
-          path: .hf-cache/hub
-          key: finance-models-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            finance-models-${{ runner.os }}-
-
-      - name: Restore pipeline checkpoint and intermediate assets
-        uses: actions/cache/restore@v4
-        with:
-          path: studio_work
-          key: finance-work-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            finance-work-${{ runner.os }}-${{ github.ref_name }}-
-
-      - name: Install system packages
-        shell: bash
+      - name: Free disk space
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            ffmpeg espeak-ng libsndfile1 fontconfig fonts-dejavu-core curl ca-certificates
-          sudo mkdir -p /usr/share/fonts/truetype/custom
-          if curl --retry 3 --retry-delay 2 -fsSL \
-            'https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton%5Bwght%5D.ttf' \
-            -o /tmp/Anton-Regular.ttf; then
-            sudo install -m 0644 /tmp/Anton-Regular.ttf /usr/share/fonts/truetype/custom/Anton-Regular.ttf
-          else
-            echo 'Anton font download unavailable; DejaVu Sans Bold remains installed as fallback.'
-          fi
-          sudo fc-cache -f
-          ffmpeg -version | head -n 2
-          ffprobe -version | head -n 1
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h
 
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: .github/workflows/stickman-finance.yml
+          python-version: "3.12"
+          cache: "pip"
 
-      - name: Install CPU PyTorch and Python dependencies
-        shell: bash
+      - name: Install system dependencies
         run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip wheel setuptools
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install \
-            "kokoro>=0.9.4" \
-            "misaki[en]>=0.9.4" \
-            "diffusers>=0.35.0" \
-            "transformers>=4.45.0" \
-            "accelerate>=0.30.0" \
-            "safetensors>=0.4.5" \
-            "huggingface_hub>=0.26.0" \
-            "pillow>=10.0.0" \
-            "soundfile>=0.12.1" \
-            "numpy>=1.26.0,<3" \
-            "requests>=2.31.0" \
-            sentencepiece
-          python - <<'PY'
-          import torch, PIL, soundfile, numpy
-          print('PyTorch:', torch.__version__, 'CUDA available:', torch.cuda.is_available())
-          print('Pillow:', PIL.__version__, 'NumPy:', numpy.__version__, 'SoundFile:', soundfile.__version__)
-          PY
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg libsndfile1 espeak-ng fonts-dejavu-core curl wget
+          ffmpeg -version | head -1
 
-      - name: Confirm local-only model configuration
+      - name: Install Python dependencies
         run: |
-          echo "Text model: $TEXT_MODEL_ID (downloaded weights, local inference)"
-          echo "Image model: $IMAGE_MODEL_ID (Diffusers local inference)"
-          echo "TTS: Kokoro voice $KOKORO_VOICE (local inference)"
-          echo "No paid AI API keys are configured."
+          python -m pip install --upgrade pip
+          pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers==0.30.3 transformers==4.44.2 accelerate==0.34.2 \
+            safetensors==0.4.5 huggingface-hub==0.25.1 Pillow==10.4.0 numpy==1.26.4 \
+            soundfile==0.12.1 kokoro-onnx==0.4.9 onnxruntime==1.19.2 ollama==0.3.3 \
+            google-api-python-client==2.149.0 google-auth-oauthlib==1.2.1 \
+            google-auth-httplib2==0.2.0 requests==2.32.3 tqdm==4.66.5 \
+            pydantic==2.9.2 python-dotenv==1.0.1 imagehash==4.3.1 \
+            tenacity==9.0.0 psutil==6.0.0 PyYAML==6.0.2
 
-      - name: Generate the documentary
-        id: build
-        shell: bash
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: |
+            models
+            ~/.cache/huggingface
+            ~/.ollama
+          key: models-${{ runner.os }}-v1
+          restore-keys: models-${{ runner.os }}-
+
+      - name: Pre-flight syntax check
+        run: python -m py_compile pipeline.py
+
+      - name: Run pipeline
         run: |
-          set -euo pipefail
-          if [[ "${{ inputs.test_run }}" == "true" ]]; then
-            echo 'Starting 1-minute TEST run (12 still images, 5 seconds each).'
-            python pipeline.py --test-run
+          set -e
+          EXTRA=""
+          if [ "$ENABLE_YOUTUBE" = "true" ]; then
+            EXTRA="--enable-youtube --youtube-privacy $YOUTUBE_PRIVACY_STATUS"
+          fi
+          if [ -n "$TOPIC" ]; then
+            EXTRA="$EXTRA --topic \"$TOPIC\""
+          fi
+          echo "Running mode=$MODE"
+          python pipeline.py --mode "$MODE" --log-level INFO $EXTRA
+
+      - name: Collect outputs
+        id: collect
+        if: always()
+        run: |
+          RUN_DIR=$(find output -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1 || true)
+          echo "run_dir=$RUN_DIR" >> $GITHUB_OUTPUT
+          if [ -n "$RUN_DIR" ] && [ -f "$RUN_DIR/video.mp4" ]; then
+            echo "has_video=true" >> $GITHUB_OUTPUT
+            ls -lh "$RUN_DIR/video.mp4"
+            ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$RUN_DIR/video.mp4" || true
           else
-            echo 'Starting full ~30-minute documentary run (360 still images, 5 seconds each).'
-            python pipeline.py
+            echo "has_video=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Publish assets to a GitHub Release
-        id: release
-        uses: softprops/action-gh-release@v3
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: stickman-finance-${{ github.run_id }}-${{ github.run_attempt }}
-          name: ${{ steps.build.outputs.release_name }}
-          body_path: output/release_notes.md
+          name: pipeline-logs-${{ github.run_id }}
+          path: |
+            output/**/logs/
+            output/**/manifest.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Create GitHub Release
+        if: steps.collect.outputs.has_video == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: stickman-${{ env.MODE }}-${{ github.run_number }}-${{ github.run_id }}
+          name: "Stickman Finance — ${{ env.MODE == 'test' && 'TEST RUN (pre-release)' || 'FULL RUN' }} #${{ github.run_number }}"
+          body: |
+            Automated Stickman Finance documentary.
+            Mode: `${{ env.MODE }}`
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            ${{ env.MODE == 'test' && 'This is a pre-release Test Run (~1 minute).' || 'Full production run.' }}
           files: |
-            output/final_documentary.mp4
-            output/thumbnail.png
-            output/youtube_seo.txt
-            output/release_notes.md
-          draft: false
-          prerelease: ${{ inputs.test_run }}
-          fail_on_unmatched_files: true
+            ${{ steps.collect.outputs.run_dir }}/video.mp4
+            ${{ steps.collect.outputs.run_dir }}/thumbnail.jpg
+            ${{ steps.collect.outputs.run_dir }}/metadata.json
+            ${{ steps.collect.outputs.run_dir }}/script.txt
+            ${{ steps.collect.outputs.run_dir }}/captions.srt
+            ${{ steps.collect.outputs.run_dir }}/subtitles.ass
+            ${{ steps.collect.outputs.run_dir }}/manifest.json
+          prerelease: ${{ env.MODE == 'test' }}
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Clean temporary assets after successful release
-        if: success()
-        run: python pipeline.py --mark-published
-
-      - name: Preserve local model cache for the next run
+      - name: Summary
         if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .hf-cache/hub
-          key: finance-models-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Preserve checkpoint for resume after failure
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: studio_work
-          key: finance-work-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Upload failure checkpoint for diagnosis
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stickman-studio-checkpoint-${{ github.run_id }}
-          path: |
-            studio_work/checkpoint.json
-            studio_work/script.json
-            studio_work/sentence_timings.json
-          if-no-files-found: ignore
-          retention-days: 14
+        run: |
+          echo "## Stickman Finance Pipeline" >> $GITHUB_STEP_SUMMARY
+          echo "- Mode: \`${{ env.MODE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Video produced: ${{ steps.collect.outputs.has_video }}" >> $GITHUB_STEP_SUMMARY
+          echo "- YouTube is optional. Failures still create the GitHub Release (Test Run = pre-release)." >> $GITHUB_STEP_SUMMARY
