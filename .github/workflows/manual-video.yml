@@ -4,169 +4,372 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Pipeline mode"
-        required: true
+        description: 'Choose the first option to verify the end-to-end pipeline before Full Run.'
         type: choice
+        required: true
+        default: 'TEST RUN — 1 minute'
         options:
-          - TEST RUN — 1 minute
-          - FULL RUN — approximately 30 minutes
-        default: "TEST RUN — 1 minute"
+          - 'TEST RUN — 1 minute'
+          - 'FULL RUN — approximately 30 minutes'
       topic:
-        description: "Video topic (leave blank for default)"
-        required: false
+        description: 'Video topic, or automatic for a local Ollama-selected topic.'
         type: string
-        default: ""
-      enable_youtube:
-        description: "Upload to YouTube if OAuth secrets are configured"
-        required: false
+        required: true
+        default: 'automatic'
+      runner_profile:
+        description: 'GitHub-hosted CPU is cheaper but cannot be expected to finish SDXL-Turbo production; choose a registered GPU runner for practical generation.'
+        type: choice
+        required: true
+        default: 'github-hosted-cpu'
+        options:
+          - 'github-hosted-cpu'
+          - 'self-hosted-gpu'
+      allow_low_ram_cpu:
+        description: 'Dangerous override: attempt CPU SDXL-Turbo even below the RAM safety threshold.'
         type: boolean
+        required: true
+        default: false
+      allow_slow_cpu_full:
+        description: 'Allow Full Run CPU image generation even if measured throughput projects over five hours.'
+        type: boolean
+        required: true
+        default: false
+      upload_youtube:
+        description: 'Attempt OAuth YouTube upload after local validation. GitHub Release remains the fallback.'
+        type: boolean
+        required: true
+        default: false
+      test_upload_enabled:
+        description: 'Explicitly allow Test Run to upload to YouTube. Test uploads may be private/unlisted only.'
+        type: boolean
+        required: true
         default: false
       youtube_privacy:
-        description: "YouTube privacy status"
-        required: false
+        description: 'Visibility for YouTube uploads. Test Run rejects public.'
         type: choice
+        required: true
+        default: 'unlisted'
         options:
-          - unlisted
-          - private
-          - public
-        default: unlisted
+          - 'unlisted'
+          - 'private'
+          - 'public'
 
 permissions:
   contents: write
   actions: read
 
 concurrency:
-  group: finance-video-${{ github.ref }}
+  group: stickman-finance-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  produce:
-    runs-on: ubuntu-latest
+  build-and-publish:
+    name: Build and publish Stickman Finance video
+    runs-on: ${{ inputs.runner_profile == 'self-hosted-gpu' && fromJSON('["self-hosted", "linux", "x64", "gpu"]') || 'ubuntu-latest' }}
     timeout-minutes: 360
     env:
-      MODE: ${{ github.event.inputs.mode == 'FULL RUN — approximately 30 minutes' && 'full' || 'test' }}
-      TOPIC: ${{ github.event.inputs.topic }}
-      ENABLE_YOUTUBE: ${{ github.event.inputs.enable_youtube }}
-      YOUTUBE_PRIVACY_STATUS: ${{ github.event.inputs.youtube_privacy }}
-      YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-      YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-      YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+      PIPELINE_MODE: ${{ inputs.mode == 'TEST RUN — 1 minute' && 'test' || 'full' }}
+      VIDEO_TOPIC: ${{ inputs.topic }}
+      RUNNER_PROFILE: ${{ inputs.runner_profile }}
+      SDXL_ALLOW_LOW_RAM_CPU: ${{ inputs.allow_low_ram_cpu }}
+      ALLOW_SLOW_CPU_FULL: ${{ inputs.allow_slow_cpu_full }}
+      UPLOAD_TO_YOUTUBE: ${{ inputs.upload_youtube }}
+      TEST_UPLOAD_ENABLED: ${{ inputs.test_upload_enabled }}
+      YOUTUBE_PRIVACY_STATUS: ${{ inputs.youtube_privacy }}
+      OLLAMA_HOST: http://127.0.0.1:11434
+      OLLAMA_MODEL: gemma2:2b
+      IMAGE_MODEL: stabilityai/sdxl-turbo
+      KOKORO_VOICE: am_puck
+      HF_HOME: ~/.cache/huggingface
+      MODEL_DIR: ~/.cache/stickman-finance-models
+      OUTPUT_ROOT: output
+      PIPELINE_RUN_ID: ${{ github.run_id }}
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      PYTHONUNBUFFERED: '1'
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Check out the two-file repository
+        uses: actions/checkout@v7.0.1 # reviewed release version; Node.js 24 runtime
 
-      - name: Free disk space
-        run: |
-          df -h
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          sudo apt-get clean
-          df -h
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7.0.0 # reviewed release version; Node.js 24 runtime
         with:
-          python-version: "3.12"
-          cache: "pip"
+          python-version: '3.11'
 
-      - name: Install system dependencies
+      - name: Restore model and package cache (best effort; never required for correctness)
+        id: model-cache
+        uses: actions/cache@v6.2.0 # reviewed release version; Node.js 24 runtime
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cache/huggingface/hub
+            ~/.cache/stickman-finance-models
+            ~/.cache/pip
+            ~/.ollama/models
+          key: stickman-finance-models-v3-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_profile }}
+
+      - name: Restore publication bundle from an earlier attempt (if this run is being retried)
+        if: ${{ github.run_attempt > 1 }}
+        uses: actions/download-artifact@v7.0.0 # reviewed release version; Node.js 24 runtime
+        continue-on-error: true
+        with:
+          name: finance-release-bundle
+          path: output
+
+      - name: Detect safe release-only retry
+        id: retry
+        shell: bash
         run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          expected_mode = __import__('os').environ['PIPELINE_MODE']
+          required = ['video.mp4', 'thumbnail.jpg', 'metadata.json', 'script.txt', 'subtitles.ass', 'captions.srt', 'manifest.json', 'validation_report.json']
+          found = None
+          for report_path in Path('output').glob('*/validation_report.json'):
+              directory = report_path.parent
+              try:
+                  report = json.loads(report_path.read_text(encoding='utf-8'))
+                  manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
+                  if report.get('status') == 'complete' and manifest.get('mode') == expected_mode and all((directory / item).is_file() and (directory / item).stat().st_size > 0 for item in required):
+                      found = directory
+                      break
+              except (OSError, ValueError, TypeError):
+                  continue
+          with open(__import__('os').environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as handle:
+              handle.write('release_only=' + ('true' if found else 'false') + '\n')
+              handle.write('bundle_dir=' + (str(found) if found else '') + '\n')
+          print('A previously validated video bundle was found; model inference can be skipped.' if found else 'No validated publication bundle found; pipeline will run or resume generation.')
+          PY
+
+      - name: Install system prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            ffmpeg libsndfile1 espeak-ng fonts-dejavu-core curl wget
-          ffmpeg -version | head -1
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ffmpeg fonts-dejavu-core espeak-ng libespeak-ng1 libsndfile1 curl ca-certificates
+          sudo rm -rf /var/lib/apt/lists/*
+          ffmpeg -version | head -n 1
+          ffmpeg -hide_banner -filters | grep -E '[[:space:]]subtitles[[:space:]]' >/dev/null || {
+            echo 'Installed FFmpeg is missing the libass subtitles filter.' >&2; exit 1;
+          }
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install diffusers==0.30.3 transformers==4.44.2 accelerate==0.34.2 \
-            safetensors==0.4.5 huggingface-hub==0.25.1 Pillow==10.4.0 numpy==1.26.4 \
-            soundfile==0.12.1 kokoro-onnx==0.4.9 onnxruntime==1.19.2 ollama==0.3.3 \
-            google-api-python-client==2.149.0 google-auth-oauthlib==1.2.1 \
-            google-auth-httplib2==0.2.0 requests==2.32.3 tqdm==4.66.5 \
-            pydantic==2.9.2 python-dotenv==1.0.1 imagehash==4.3.1 \
-            tenacity==9.0.0 psutil==6.0.0 PyYAML==6.0.2
-
-      - name: Cache models
-        uses: actions/cache@v4
-        with:
-          path: |
-            models
-            ~/.cache/huggingface
-            ~/.ollama
-          key: models-${{ runner.os }}-v1
-          restore-keys: models-${{ runner.os }}-
-
-      - name: Pre-flight syntax check
-        run: python -m py_compile pipeline.py
-
-      - name: Run pipeline
-        run: |
-          set -e
-          EXTRA=""
-          if [ "$ENABLE_YOUTUBE" = "true" ]; then
-            EXTRA="--enable-youtube --youtube-privacy $YOUTUBE_PRIVACY_STATUS"
-          fi
-          if [ -n "$TOPIC" ]; then
-            EXTRA="$EXTRA --topic \"$TOPIC\""
-          fi
-          echo "Running mode=$MODE"
-          python pipeline.py --mode "$MODE" --log-level INFO $EXTRA
-
-      - name: Collect outputs
-        id: collect
-        if: always()
-        run: |
-          RUN_DIR=$(find output -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1 || true)
-          echo "run_dir=$RUN_DIR" >> $GITHUB_OUTPUT
-          if [ -n "$RUN_DIR" ] && [ -f "$RUN_DIR/video.mp4" ]; then
-            echo "has_video=true" >> $GITHUB_OUTPUT
-            ls -lh "$RUN_DIR/video.mp4"
-            ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$RUN_DIR/video.mp4" || true
-          else
-            echo "has_video=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pipeline-logs-${{ github.run_id }}
-          path: |
-            output/**/logs/
-            output/**/manifest.json
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Create GitHub Release
-        if: steps.collect.outputs.has_video == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: stickman-${{ env.MODE }}-${{ github.run_number }}-${{ github.run_id }}
-          name: "Stickman Finance — ${{ env.MODE == 'test' && 'TEST RUN (pre-release)' || 'FULL RUN' }} #${{ github.run_number }}"
-          body: |
-            Automated Stickman Finance documentary.
-            Mode: `${{ env.MODE }}`
-            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            ${{ env.MODE == 'test' && 'This is a pre-release Test Run (~1 minute).' || 'Full production run.' }}
-          files: |
-            ${{ steps.collect.outputs.run_dir }}/video.mp4
-            ${{ steps.collect.outputs.run_dir }}/thumbnail.jpg
-            ${{ steps.collect.outputs.run_dir }}/metadata.json
-            ${{ steps.collect.outputs.run_dir }}/script.txt
-            ${{ steps.collect.outputs.run_dir }}/captions.srt
-            ${{ steps.collect.outputs.run_dir }}/subtitles.ass
-            ${{ steps.collect.outputs.run_dir }}/manifest.json
-          prerelease: ${{ env.MODE == 'test' }}
-          fail_on_unmatched_files: false
+      - name: Install Python runtime dependencies
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Summary
-        if: always()
+          RELEASE_ONLY: ${{ steps.retry.outputs.release_only }}
         run: |
-          echo "## Stickman Finance Pipeline" >> $GITHUB_STEP_SUMMARY
-          echo "- Mode: \`${{ env.MODE }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Video produced: ${{ steps.collect.outputs.has_video }}" >> $GITHUB_STEP_SUMMARY
-          echo "- YouTube is optional. Failures still create the GitHub Release (Test Run = pre-release)." >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          python -m pip install --upgrade 'pip==25.1.1'
+          if [[ "$RELEASE_ONLY" == 'true' ]]; then
+            # Release-only validation uses existing video/metadata/checkpoints; no inference stack is needed.
+            python -m pip install \
+              'requests==2.32.4' \
+              'Pillow==11.2.1' \
+              'google-api-python-client==2.169.0' \
+              'google-auth==2.40.1' \
+              'google-auth-httplib2==0.2.0' \
+              'google-auth-oauthlib==1.2.2'
+            exit 0
+          fi
+          if [[ "$RUNNER_PROFILE" == 'self-hosted-gpu' ]]; then
+            python -m pip install 'torch==2.6.0' --index-url https://download.pytorch.org/whl/cu124
+          else
+            python -m pip install 'torch==2.6.0' --index-url https://download.pytorch.org/whl/cpu
+          fi
+          python -m pip install \
+            'numpy==2.2.6' \
+            'requests==2.32.4' \
+            'Pillow==11.2.1' \
+            'psutil==7.0.0' \
+            'soundfile==0.13.1' \
+            'diffusers==0.33.1' \
+            'transformers==4.51.3' \
+            'accelerate==1.7.0' \
+            'huggingface-hub==0.31.2' \
+            'safetensors==0.5.3' \
+            'kokoro-onnx==0.6.1' \
+            'onnxruntime==1.22.0' \
+            'google-api-python-client==2.169.0' \
+            'google-auth==2.40.1' \
+            'google-auth-httplib2==0.2.0' \
+            'google-auth-oauthlib==1.2.2'
+          python -m pip check
+
+      - name: Compile Python and run built-in unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile pipeline.py
+          python pipeline.py --self-test
+          python pipeline.py --help-files
+          python -m pip check
+
+      - name: Install Ollama (official installer; localhost only)
+        if: ${{ steps.retry.outputs.release_only != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 300 https://ollama.com/install.sh \
+            --output /tmp/ollama-install.sh
+          bash /tmp/ollama-install.sh
+          ollama --version
+
+      - name: Start local Ollama and ensure gemma2:2b is available
+        if: ${{ steps.retry.outputs.release_only != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OLLAMA_HOST=127.0.0.1:11434 nohup ollama serve >/tmp/ollama.log 2>&1 &
+          ready=0
+          for attempt in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:11434/api/tags >/dev/null; then ready=1; break; fi
+            sleep 2
+          done
+          if [[ "$ready" != '1' ]]; then
+            echo 'Ollama did not become healthy on 127.0.0.1:11434. Redacted server-log tail:' >&2
+            tail -n 50 /tmp/ollama.log >&2 || true
+            exit 1
+          fi
+          ollama pull gemma2:2b
+          curl --fail --silent http://127.0.0.1:11434/api/tags | python -c 'import json,sys; d=json.load(sys.stdin); names=[x.get("name",x.get("model","")) for x in d.get("models",[])]; assert any(n == "gemma2:2b" for n in names), f"gemma2:2b missing from Ollama tags: {names}"; print("Ollama gemma2:2b verified")'
+
+      - name: Run Test Run or Full Run (all AI inference remains local)
+        id: pipeline
+        shell: bash
+        env:
+          RELEASE_ONLY: ${{ steps.retry.outputs.release_only }}
+          RESTORED_BUNDLE_DIR: ${{ steps.retry.outputs.bundle_dir }}
+          GH_RUN_ID: ${{ github.run_id }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_ONLY" == 'true' ]]; then
+            echo "Validating restored bundle for release-only retry: $RESTORED_BUNDLE_DIR"
+            python pipeline.py --mode "$PIPELINE_MODE" --validate-existing "$RESTORED_BUNDLE_DIR"
+            BUNDLE_DIR="$RESTORED_BUNDLE_DIR"
+          else
+            args=(--mode "$PIPELINE_MODE" --topic "$VIDEO_TOPIC" --run-id "$GH_RUN_ID")
+            if [[ "$ALLOW_SLOW_CPU_FULL" == 'true' ]]; then args+=(--allow-slow-cpu-full); fi
+            python pipeline.py "${args[@]}"
+            BUNDLE_DIR="$(python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['OUTPUT_ROOT'])
+          run_id = os.environ['GH_RUN_ID']
+          matches = []
+          for manifest_path in root.glob('*/manifest.json'):
+              try:
+                  data=json.loads(manifest_path.read_text(encoding='utf-8'))
+                  if data.get('run_id') == run_id and data.get('mode') == os.environ['PIPELINE_MODE'] and data.get('stages',{}).get('local_pipeline',{}).get('status') == 'complete':
+                      matches.append(manifest_path.parent)
+              except (OSError, ValueError):
+                  continue
+          if len(matches) != 1:
+              raise SystemExit(f'Expected exactly one completed output bundle for run {run_id}; found {len(matches)}')
+          print(matches[0])
+          PY
+          )"
+          fi
+          for file in video.mp4 thumbnail.jpg metadata.json script.txt subtitles.ass captions.srt manifest.json validation_report.json; do
+            test -s "$BUNDLE_DIR/$file" || { echo "Missing required release asset: $BUNDLE_DIR/$file" >&2; exit 1; }
+          done
+          echo "bundle_dir=$BUNDLE_DIR" >> "$GITHUB_OUTPUT"
+          echo "validated_bundle=$BUNDLE_DIR"
+
+      - name: Publish GitHub Release (Test Run is always a prerelease)
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_DIR: ${{ steps.pipeline.outputs.bundle_dir }}
+          PIPELINE_MODE: ${{ env.PIPELINE_MODE }}
+          GH_SHA: ${{ github.sha }}
+          GH_REPO: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python - "$BUNDLE_DIR" <<'PY'
+          import json, sys
+          from pathlib import Path
+          path=Path(sys.argv[1])
+          report=json.loads((path/'validation_report.json').read_text(encoding='utf-8'))
+          manifest=json.loads((path/'manifest.json').read_text(encoding='utf-8'))
+          if report.get('status') != 'complete' or manifest.get('stages',{}).get('local_pipeline',{}).get('status') != 'complete':
+              raise SystemExit('Refusing release: final validation report/manifest is not complete.')
+          for name in ('video.mp4','thumbnail.jpg','metadata.json','script.txt','subtitles.ass','captions.srt','manifest.json','validation_report.json'):
+              item=path/name
+              if not item.is_file() or item.stat().st_size == 0:
+                  raise SystemExit(f'Refusing release: missing/empty asset {name}')
+              if item.stat().st_size > 2 * 1024**3:
+                  raise SystemExit(f'Refusing release: {name} exceeds the conservative 2 GiB per-asset limit. Reduce encode size or use external hosting; file is preserved as workflow artifact if quota allows.')
+          if manifest.get('mode') not in ('test','full'):
+              raise SystemExit('Refusing release: unexpected manifest mode.')
+          print(f"Release pre-validation passed: {manifest.get('mode')} / {manifest.get('rendered_video_duration_seconds')} sec")
+          PY
+          TAG="stickman-finance-${PIPELINE_MODE}-${GH_RUN_ID}"
+          if [[ "$PIPELINE_MODE" == 'test' ]]; then
+            TITLE="[PRE-RELEASE] Stickman Finance Test Run #${GH_RUN_ID}"
+            NOTES=$'Automated Stickman Finance TEST RUN. This is a prerelease and is intended for validation, not a finished full documentary.\n\nGenerated assets were validated before publication.'
+          else
+            TITLE="Stickman Finance Documentary #${GH_RUN_ID}"
+            NOTES=$'Automated Stickman Finance FULL RUN.\n\nGenerated assets were validated before publication.'
+          fi
+          mapfile -t ASSETS < <(printf '%s\n' \
+            "$BUNDLE_DIR/video.mp4" \
+            "$BUNDLE_DIR/thumbnail.jpg" \
+            "$BUNDLE_DIR/metadata.json" \
+            "$BUNDLE_DIR/script.txt" \
+            "$BUNDLE_DIR/subtitles.ass" \
+            "$BUNDLE_DIR/captions.srt" \
+            "$BUNDLE_DIR/manifest.json" \
+            "$BUNDLE_DIR/validation_report.json")
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; updating its assets without creating a duplicate release."
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo "$GH_REPO"
+          else
+            if [[ "$PIPELINE_MODE" == 'test' ]]; then
+              gh release create "$TAG" "${ASSETS[@]}" --title "$TITLE" --notes "$NOTES" --prerelease --target "$GH_SHA" --repo "$GH_REPO"
+            else
+              gh release create "$TAG" "${ASSETS[@]}" --title "$TITLE" --notes "$NOTES" --target "$GH_SHA" --repo "$GH_REPO"
+            fi
+          fi
+          echo "Published GitHub Release: $TAG"
+
+      - name: Preserve validated output as a retry artifact or failed-run diagnostic
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.2 # reviewed release version; Node.js 24 runtime
+        continue-on-error: true # GitHub Free artifact storage is limited; a validated Release must not be marked failed because its optional recovery copy exceeds quota.
+        with:
+          name: finance-release-bundle
+          path: |
+            output/*/video.mp4
+            output/*/thumbnail.jpg
+            output/*/metadata.json
+            output/*/script.txt
+            output/*/subtitles.ass
+            output/*/captions.srt
+            output/*/manifest.json
+            output/*/validation_report.json
+            output/*/logs/*.log
+            output/*/audio/**
+            output/*/scenes/**
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+          overwrite: true
+
+      - name: Print publication summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          echo "Selected mode: $PIPELINE_MODE"
+          echo "Runner profile: $RUNNER_PROFILE"
+          echo "Test Run Release type: prerelease"
+          echo "If YouTube OAuth/API upload was unavailable or failed, pipeline.py preserved the local video and the GitHub Release step publishes it instead."
+          echo "Files are persisted by a GitHub Release on success; workflow artifacts are a best-effort 7-day recovery copy on failure. Hosted-runner temporary files otherwise disappear after the job."
